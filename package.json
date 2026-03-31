@@ -1,7 +1,11 @@
 {
   "name": "pi-subagent-in-memory",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "In-process subagent tool for pi with live TUI card widgets, JSONL session logging, and zero system-prompt overhead.",
+  "repository": {
+    "type": "git",
+    "url": "git@github.com:ross-jill-ws/pi-subagent-in-memory.git"
+  },
   "author": "Ross Z",
   "license": "MIT",
   "keywords": [
