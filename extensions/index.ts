@@ -15,6 +15,7 @@
  * - Nested subagent support (subagents can spawn subagents)
  * - /in-memory-clear-widgets slash command to remove widget cards
  * - Multi-provider support (Anthropic, OpenAI, Google, etc.)
+ * - Ctrl+Alt+<N> to inspect subagent prompt & live messages
  *
  * Results are written to ./.pi/subagent-in-memory/<mainSessionId>/subagent_<N>/result.md
  * (or error.md on failure) so the calling agent gets a short pointer instead of
@@ -38,7 +39,8 @@ import type { AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-
 import { resolveModel } from "./model.ts";
 import { renderCard, type CardTheme } from "./tui-draw.ts";
 
-import { visibleWidth, truncateToWidth } from "@mariozechner/pi-tui";
+import { visibleWidth, truncateToWidth, wrapTextWithAnsi, matchesKey, Key } from "@mariozechner/pi-tui";
+import type { Focusable } from "@mariozechner/pi-tui";
 import { mkdirSync, writeFileSync, appendFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -50,11 +52,13 @@ function jsonlAppend(filePath: string, data: Record<string, any>) {
 
 // ── Subagent card state ─────────────────────────────────────────
 interface SubagentCard {
+  num: number;
   sessionId: string;
   title: string;
   modelLabel: string;
   status: "created" | "running" | "completed" | "error";
-  textPreview: string;
+  prompt: string;
+  messages: string;
   columnWidthPercent: number;
   startedAt: number;
   endedAt?: number;
@@ -81,76 +85,232 @@ const subagents: SubagentCard[] = [];
 let currentCtx: { ui: any } | null = null;
 let mainSessionId = "unknown";
 let subagentCount = 0;
+let flashTimer: ReturnType<typeof setInterval> | null = null;
+
+// Track open detail overlay so we can trigger re-renders
+let activeDetailTui: any = null;
 
 function updateSubagentWidget() {
   if (!currentCtx) return;
   const ctx = currentCtx;
 
+  // Start flash timer for "working..." dot animation if not already running
+  if (!flashTimer) {
+    flashTimer = setInterval(() => {
+      const hasActive = subagents.some((sa) => sa.status === "running" || sa.status === "created");
+      if (currentCtx && (hasActive || activeDetailTui)) {
+        currentCtx.ui.setWidget(
+          "in-memory-subagent-cards",
+          buildWidgetFactory(),
+          { placement: "aboveEditor" }
+        );
+        // Also re-render the detail overlay if open
+        if (activeDetailTui) {
+          try { activeDetailTui.requestRender(); } catch {}
+        }
+      }
+    }, 500);
+  }
+
   ctx.ui.setWidget(
     "in-memory-subagent-cards",
-    (_tui: any, theme: any) => ({
-      render(width: number): string[] {
-        if (subagents.length === 0) return [];
+    buildWidgetFactory(),
+    { placement: "aboveEditor" }
+  );
+}
 
-        // Derive cols from columnWidthPercent (all cards share the same value).
-        const pct = subagents[subagents.length - 1].columnWidthPercent;
-        const cols = Math.min(3, Math.max(1, Math.round(100 / pct)));
-        const gap = 1;
-        const colWidth = Math.floor((width - gap * (cols - 1)) / cols);
-        const maxContentLines = 4;
-        const lines: string[] = [""];
+function buildWidgetFactory() {
+  return (_tui: any, theme: any) => ({
+    render(width: number): string[] {
+      if (subagents.length === 0) return [];
 
-        for (let i = 0; i < subagents.length; i += cols) {
-          const rowCards = subagents.slice(i, i + cols).map((sa, idx) => {
-            const cardTheme = CARD_THEMES[(i + idx) % CARD_THEMES.length];
+      // Derive cols from columnWidthPercent (all cards share the same value).
+      const pct = subagents[subagents.length - 1].columnWidthPercent;
+      const cols = Math.min(3, Math.max(1, Math.round(100 / pct)));
+      const gap = 1;
+      const colWidth = Math.floor((width - gap * (cols - 1)) / cols);
+      const maxContentLines = 4;
+      const lines: string[] = [""];
 
-            const titleText = `${sa.title} [${sa.modelLabel}]`;
-            const innerW = colWidth - 4;
+      for (let i = 0; i < subagents.length; i += cols) {
+        const rowCards = subagents.slice(i, i + cols).map((sa, idx) => {
+          const cardTheme = CARD_THEMES[(i + idx) % CARD_THEMES.length];
 
-            const allText = sa.textPreview || "…";
-            const contentLines = allText.split("\n");
-            const trimmedLines = contentLines.map((l) =>
-              visibleWidth(l) > innerW ? "…" + truncateToWidth(l, innerW - 1) : l
-            );
-            const visible = trimmedLines.slice(-maxContentLines);
-            const content = (contentLines.length > maxContentLines ? "…\n" : "") + visible.join("\n");
+          const titleText = `${sa.title} [${sa.modelLabel}]`;
+          const innerW = colWidth - 4;
 
-            const statusIcon = sa.status === "completed" ? "✓" : sa.status === "error" ? "✗" : "●";
-            const footer = `${statusIcon} ${formatElapsed(sa.startedAt, sa.endedAt)}`;
+          // Show the prompt as content
+          const allText = sa.prompt || "…";
+          const contentLines = allText.split("\n");
+          const trimmedLines = contentLines.map((l) =>
+            visibleWidth(l) > innerW ? truncateToWidth(l, innerW - 1) + "…" : l
+          );
+          const visible = trimmedLines.slice(0, maxContentLines);
+          const content = visible.join("\n") + (contentLines.length > maxContentLines ? "\n…" : "");
 
-            return renderCard({
-              title: titleText,
-              content,
-              footer,
-              colWidth,
-              theme,
-              cardTheme,
-            });
+          // Status indicator with animated dots for "working"
+          // All status strings are padded to the same visible width so the
+          // elapsed-time counter stays in a fixed column.
+          let statusRaw: string;
+          if (sa.status === "created") {
+            statusRaw = "⏳ started";
+          } else if (sa.status === "running") {
+            const dotPhase = Math.floor(Date.now() / 2000) % 3;
+            statusRaw = "⚡ working" + ".".repeat(dotPhase + 1);
+          } else if (sa.status === "completed") {
+            statusRaw = "✅ finished";
+          } else {
+            statusRaw = "❌ error";
+          }
+          // Pad to fixed visible width (longest is "⚡ working..." or "✅ finished")
+          const STATUS_WIDTH = 14;
+          const visPad = Math.max(0, STATUS_WIDTH - visibleWidth(statusRaw));
+          const elapsed = formatElapsed(sa.startedAt, sa.endedAt);
+          const footer = `${statusRaw}${" ".repeat(visPad)} ${elapsed}`;
+
+          return renderCard({
+            title: titleText,
+            badge: `#${sa.num}`,
+            content,
+            footer,
+            footerRight: `Ctrl+${sa.num}`,
+            colWidth,
+            theme,
+            cardTheme,
           });
+        });
 
-          // Pad incomplete rows
-          while (rowCards.length < cols) {
-            rowCards.push(Array(rowCards[0].length).fill(" ".repeat(colWidth)));
-          }
+        // Pad incomplete rows
+        while (rowCards.length < cols) {
+          rowCards.push(Array(rowCards[0].length).fill(" ".repeat(colWidth)));
+        }
 
-          const cardHeight = Math.max(...rowCards.map((c) => c.length));
-          for (const card of rowCards) {
-            while (card.length < cardHeight) {
-              card.push(" ".repeat(colWidth));
-            }
-          }
-
-          for (let row = 0; row < cardHeight; row++) {
-            lines.push(rowCards.map((card) => card[row]).join(" ".repeat(gap)));
+        const cardHeight = Math.max(...rowCards.map((c) => c.length));
+        for (const card of rowCards) {
+          while (card.length < cardHeight) {
+            card.push(" ".repeat(colWidth));
           }
         }
 
-        return lines;
-      },
-      invalidate() {},
-    }),
-    { placement: "aboveEditor" }
-  );
+        for (let row = 0; row < cardHeight; row++) {
+          lines.push(rowCards.map((card) => card[row]).join(" ".repeat(gap)));
+        }
+      }
+
+      return lines;
+    },
+    invalidate() {},
+  });
+}
+
+// ── Detail overlay component ────────────────────────────────────
+class SubagentDetailOverlay implements Focusable {
+  focused = false;
+
+  constructor(
+    private card: SubagentCard,
+    private cardNum: number,
+    private theme: any,
+    private done: (result: void) => void,
+  ) {}
+
+  handleInput(data: string): void {
+    // Close on Escape, Enter, or the same Ctrl+N that opened it
+    if (
+      matchesKey(data, "escape") ||
+      matchesKey(data, "return") ||
+      matchesKey(data, Key.ctrl(`${this.cardNum}` as any))
+    ) {
+      this.done();
+      return;
+    }
+  }
+
+  render(width: number): string[] {
+    const th = this.theme;
+    const sa = this.card;
+    const innerW = width - 2; // borders are 2 chars total
+
+    const pad = (s: string, len: number) => {
+      const vis = visibleWidth(s);
+      return s + " ".repeat(Math.max(0, len - vis));
+    };
+    const row = (content: string) =>
+      th.fg("border", "│") + pad(content, innerW) + th.fg("border", "│");
+    const divider = () =>
+      th.fg("border", "├" + "─".repeat(innerW) + "┤");
+
+    const lines: string[] = [];
+
+    // Top border
+    lines.push(th.fg("border", "╭" + "─".repeat(innerW) + "╮"));
+
+    // Header
+    const statusIcon = sa.status === "created" ? "⏳"
+      : sa.status === "running" ? "⚡"
+      : sa.status === "completed" ? "✅"
+      : "❌";
+    const headerText = ` ${statusIcon} Subagent #${sa.num}: ${sa.title} [${sa.modelLabel}]`;
+    lines.push(row(th.fg("accent", th.bold(truncateToWidth(headerText, innerW)))));
+    lines.push(row(th.fg("dim", ` ${formatElapsed(sa.startedAt, sa.endedAt)} elapsed`)));
+
+    // Prompt section — word-wrap to show at least 3 lines, max 5
+    lines.push(divider());
+    lines.push(row(th.fg("accent", " PROMPT")));
+    const promptWrapWidth = innerW - 2; // 1 char padding each side
+    const promptLines = wrapTextWithAnsi(sa.prompt, promptWrapWidth);
+    const PROMPT_MIN = 3;
+    const PROMPT_MAX = 5;
+    const promptDisplay = promptLines.slice(0, PROMPT_MAX);
+    for (const pl of promptDisplay) {
+      lines.push(row(" " + th.fg("text", truncateToWidth(pl, innerW - 1))));
+    }
+    // Pad to minimum rows so prompt section is always visible
+    for (let r = promptDisplay.length; r < PROMPT_MIN; r++) {
+      lines.push(row(""));
+    }
+    if (promptLines.length > PROMPT_MAX) {
+      lines.push(row(th.fg("dim", ` … (${promptLines.length - PROMPT_MAX} more lines)`)));
+    }
+
+    // Messages section — always show latest 5 lines
+    lines.push(divider());
+    lines.push(row(th.fg("accent", " MESSAGES")));
+
+    const MSG_VISIBLE = 5;
+    const msgText = sa.messages || "(no messages yet)";
+    const allMsgLines = msgText.split("\n");
+    // Always auto-scroll to the latest lines
+    const msgStart = Math.max(0, allMsgLines.length - MSG_VISIBLE);
+    const visibleMsgLines = allMsgLines.slice(msgStart);
+    for (const ml of visibleMsgLines) {
+      lines.push(row(" " + th.fg("muted", truncateToWidth(ml, innerW - 1))));
+    }
+    // Pad to minimum rows
+    for (let r = visibleMsgLines.length; r < MSG_VISIBLE; r++) {
+      lines.push(row(""));
+    }
+    if (allMsgLines.length > MSG_VISIBLE) {
+      lines.push(row(th.fg("dim", ` … ${allMsgLines.length - MSG_VISIBLE} earlier lines hidden`)));
+    }
+
+    // Bottom border with right-aligned hint
+    const hint = ` Esc / Ctrl+${sa.num} `;
+    const hintLen = hint.length;
+    const dashBefore = Math.max(0, innerW - hintLen);
+    lines.push(
+      th.fg("border", "╰" + "─".repeat(dashBefore)) +
+      th.fg("dim", hint) +
+      th.fg("border", "╯")
+    );
+
+    return lines;
+  }
+
+  invalidate(): void {}
+  dispose(): void {
+    activeDetailTui = null;
+  }
 }
 
 // ── Parameter schema ────────────────────────────────────────────
@@ -188,6 +348,11 @@ const SubagentParams = Type.Object({
 });
 
 type SubagentParamsType = Static<typeof SubagentParams>;
+
+// ── Helper: append to card messages ─────────────────────────────
+function appendMessage(card: SubagentCard, msg: string) {
+  card.messages += (card.messages ? "\n" : "") + msg;
+}
 
 // ── Core execution logic ────────────────────────────────────────
 async function executeSubagent(
@@ -267,11 +432,13 @@ async function executeSubagent(
 
   // Track card
   const card: SubagentCard = {
+    num: subagentNum,
     sessionId: session.sessionId,
     title: params.title ?? params.task.slice(0, 30),
     modelLabel: modelId,
     status: "created",
-    textPreview: "",
+    prompt: params.task,
+    messages: "",
     columnWidthPercent: params.columnWidthPercent ?? 50,
     startedAt: Date.now(),
   };
@@ -296,6 +463,7 @@ async function executeSubagent(
     session.abort();
     card.status = "error";
     card.endedAt = Date.now();
+    appendMessage(card, "[aborted]");
     updateSubagentWidget();
   };
 
@@ -318,6 +486,7 @@ async function executeSubagent(
         switch (event.type) {
           case "agent_start":
             card.status = "running";
+            appendMessage(card, "[agent started]");
             updateSubagentWidget();
             jsonlAppend(jsonlPath, baseLog);
             lastEventId = eventId;
@@ -332,8 +501,8 @@ async function executeSubagent(
             if (ame.type === "text_delta") {
               textDeltaBuffer += ame.delta;
               finalText += ame.delta;
-              card.textPreview = finalText;
-              updateSubagentWidget();
+              // Append delta text to messages for live view
+              card.messages += ame.delta;
               onUpdate?.({
                 content: [{ type: "text", text: finalText }],
                 details: {
@@ -369,8 +538,7 @@ async function executeSubagent(
           }
 
           case "tool_execution_start":
-            card.textPreview = finalText + `\n[${event.toolName} ⏳]`;
-            updateSubagentWidget();
+            appendMessage(card, `\n[🔧 ${event.toolName} ⏳]`);
             jsonlAppend(jsonlPath, { ...baseLog, toolName: event.toolName, args: event.args });
             lastEventId = eventId;
             onUpdate?.({
@@ -385,8 +553,7 @@ async function executeSubagent(
             break;
 
           case "tool_execution_end":
-            card.textPreview = finalText + `\n[${event.toolName} ${event.isError ? "❌" : "✅"}]`;
-            updateSubagentWidget();
+            appendMessage(card, `[🔧 ${event.toolName} ${event.isError ? "❌" : "✅"}]`);
             jsonlAppend(jsonlPath, { ...baseLog, toolName: event.toolName, isError: event.isError, result: event.result });
             lastEventId = eventId;
             onUpdate?.({
@@ -406,6 +573,7 @@ async function executeSubagent(
           case "agent_end":
             card.status = "completed";
             card.endedAt = Date.now();
+            appendMessage(card, "\n[agent completed]");
             updateSubagentWidget();
             jsonlAppend(jsonlPath, { ...baseLog, finalTextLength: finalText.length });
             resolve(finalText || "Subagent completed with no text output.");
@@ -444,6 +612,7 @@ async function executeSubagent(
       session.prompt(params.task).catch((err) => {
         card.status = "error";
         card.endedAt = Date.now();
+        appendMessage(card, `[error: ${err?.message ?? String(err)}]`);
         updateSubagentWidget();
         reject(err);
       });
@@ -519,10 +688,43 @@ export default function (pi: ExtensionAPI) {
     description: "Clear all in-memory subagent card widgets",
     handler: async (_args, ctx) => {
       subagents.length = 0;
+      if (flashTimer) { clearInterval(flashTimer); flashTimer = null; }
       ctx.ui.setWidget("in-memory-subagent-cards", undefined);
       ctx.ui.notify("In-memory subagent widgets cleared", "info");
     },
   });
+
+  // Register Ctrl+1 through Ctrl+9 to open subagent detail overlay
+  for (let n = 1; n <= 9; n++) {
+    pi.registerShortcut(Key.ctrl(`${n}` as any), {
+      description: `Inspect subagent #${n}`,
+      handler: async (ctx) => {
+        const card = subagents.find((sa) => sa.num === n);
+        if (!card) {
+          ctx.ui.notify(`No subagent #${n}`, "warning");
+          return;
+        }
+
+        await ctx.ui.custom<void>(
+          (tui: any, theme: any, _keybindings: any, done: (result: void) => void) => {
+            activeDetailTui = tui;
+            return new SubagentDetailOverlay(card, n, theme, done);
+          },
+          {
+            overlay: true,
+            overlayOptions: {
+              anchor: "center",
+              width: "80%",
+              maxHeight: "80%",
+              minWidth: 60,
+            },
+          }
+        );
+
+        activeDetailTui = null;
+      },
+    });
+  }
 
   pi.registerTool<typeof SubagentParams>({
     name: "subagent_create",

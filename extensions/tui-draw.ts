@@ -14,8 +14,10 @@ export interface CardTheme {
 
 export interface RenderCardOptions {
   title: string;
+  badge?: string;
   content?: string;
   footer?: string;
+  footerRight?: string;
   colWidth: number;
   theme: {
     fg: (style: string, text: string) => string;
@@ -31,7 +33,7 @@ export interface RenderCardOptions {
  * Each line is exactly `colWidth` visible characters wide (including borders).
  */
 export function renderCard(opts: RenderCardOptions): string[] {
-  const { title, content, footer, colWidth, theme, cardTheme } = opts;
+  const { title, badge, content, footer, colWidth, theme, cardTheme } = opts;
   const w = colWidth - 2; // inner width (minus left+right border)
   const { bg, br } = cardTheme;
 
@@ -43,15 +45,28 @@ export function renderCard(opts: RenderCardOptions): string[] {
     return bord("│") + bg + text + bg + pad + BG_RESET + bord("│");
   };
 
+  /** Like borderLine but places a right-aligned badge before the right border */
+  const borderLineWithBadge = (text: string, badgeText: string) => {
+    const styledBadge = theme.fg("accent", theme.bold(badgeText));
+    const badgeVisLen = visibleWidth(badgeText);
+    const textVisLen = visibleWidth(text);
+    const gap = Math.max(1, w - textVisLen - badgeVisLen);
+    return bord("│") + bg + text + bg + " ".repeat(gap) + styledBadge + BG_RESET + bord("│");
+  };
+
   const top = "┌" + "─".repeat(w) + "┐";
   const bot = "└" + "─".repeat(w) + "┘";
 
   const lines: string[] = [bord(top)];
 
-  // Title — truncate raw text, then style
-  const truncTitle = truncateToWidth(title, w - 1);
+  // Title line — with optional badge on the right
+  const truncTitle = truncateToWidth(title, badge ? w - visibleWidth(badge) - 2 : w - 1);
   const styledTitle = theme.fg("accent", theme.bold(truncTitle));
-  lines.push(borderLine(" " + styledTitle));
+  if (badge) {
+    lines.push(borderLineWithBadge(" " + styledTitle, badge));
+  } else {
+    lines.push(borderLine(" " + styledTitle));
+  }
 
   // Content (defaults to "ready" muted) — supports multi-line
   const contentText = content ?? "ready";
@@ -61,11 +76,24 @@ export function renderCard(opts: RenderCardOptions): string[] {
     lines.push(borderLine(" " + styledContent));
   }
 
-  // Optional footer — truncate then style
+  // Optional footer — with optional right-aligned text
   if (footer !== undefined) {
-    const truncFooter = truncateToWidth(footer, w - 1);
-    const styledFooter = theme.fg("muted", truncFooter);
-    lines.push(borderLine(" " + styledFooter));
+    const { footerRight } = opts;
+    if (footerRight) {
+      const rightVis = visibleWidth(footerRight);
+      const maxLeft = w - rightVis - 2; // 1 pad each side
+      const truncFooter = truncateToWidth(footer, maxLeft);
+      const styledLeft = theme.fg("muted", truncFooter);
+      const styledRight = theme.fg("dim", footerRight);
+      const leftVis = visibleWidth(truncFooter);
+      const gap = Math.max(1, w - 1 - leftVis - rightVis);
+      const combined = " " + styledLeft + " ".repeat(gap) + styledRight;
+      lines.push(borderLine(combined));
+    } else {
+      const truncFooter = truncateToWidth(footer, w - 1);
+      const styledFooter = theme.fg("muted", truncFooter);
+      lines.push(borderLine(" " + styledFooter));
+    }
   }
 
   lines.push(bord(bot));
