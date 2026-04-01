@@ -32,10 +32,19 @@ If `provider` and `model` are omitted, the subagent inherits the main agent's mo
 
 Each running subagent is displayed as a colored card widget above the editor:
 
-- Cards show **title**, **model**, **live output preview**, **elapsed time**, and **status icon** (● running, ✓ completed, ✗ error)
+- Cards show **title**, **model**, **prompt preview**, **elapsed time**, and **status indicator** (⏳ started, ⚡ working…, ✅ finished, ❌ error)
+- The prompt passed to the subagent is displayed as card content, so you can see at a glance what each subagent is doing
 - Cards auto-layout into a responsive grid (1–3 columns based on `columnWidthPercent`)
-- Output preview shows the last 4 lines of subagent activity, including tool execution indicators (⏳ running, ✅ done, ❌ failed)
+- Subagent number badge (`#1`, `#2`, …) shown on the top-right corner of each card
 - Six rotating color themes for visual distinction between cards
+
+### 🔍 Subagent Detail Overlay (`Ctrl+N`)
+
+Press **Ctrl+1** through **Ctrl+9** to open a detail popup for the corresponding subagent:
+
+- **Prompt** — Full prompt text with word wrapping (up to 5 lines)
+- **Messages** — Live-updating stream of the subagent's activity (text output, tool calls, status changes), always showing the latest 5 lines
+- Press the same **Ctrl+N** shortcut or **Escape** to close the overlay
 
 ### 📝 JSONL Session Logging
 
