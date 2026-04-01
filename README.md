@@ -77,40 +77,14 @@ Type `/in-memory-clear-widgets` in the pi prompt to clear all subagent card widg
 
 ## Install
 
-### From local path (recommended for development)
-
 ```bash
-pi install /path/to/pi-subagent-in-memory
-```
-
-### From a git repository
-
-```bash
-pi install git:github.com/your-org/pi-subagent-in-memory
-```
-
-### Project-local install (shared with team via `.pi/settings.json`)
-
-```bash
-pi install -l /path/to/pi-subagent-in-memory
-```
-
-### One-time use without installing
-
-```bash
-pi -e /path/to/pi-subagent-in-memory/extensions/index.ts
+pi install npm:pi-subagent-in-memory
 ```
 
 ## Remove
 
 ```bash
-pi remove pi-subagent-in-memory
-```
-
-For project-local installs:
-
-```bash
-pi remove -l pi-subagent-in-memory
+pi remove npm:pi-subagent-in-memory
 ```
 
 ## Verify Installation
