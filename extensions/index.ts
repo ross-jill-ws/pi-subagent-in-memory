@@ -460,8 +460,8 @@ async function executeSubagent(
   fallbackCwd?: string,
 ): Promise<AgentToolResult<any>> {
   subagentCount++;
-  const subagentNum = subagentCount;
-  const outDir = join(".pi", "subagent-in-memory", mainSessionId, `subagent_${subagentNum}`);
+  const subagentNum = subagents.length + 1; // display number based on currently visible cards
+  const outDir = join(".pi", "subagent-in-memory", mainSessionId, `subagent_${subagentCount}`);
   mkdirSync(outDir, { recursive: true });
 
   // Parse "provider/model" format (e.g. "openai/gpt-4o-mini")
