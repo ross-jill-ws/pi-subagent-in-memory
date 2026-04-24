@@ -1,4 +1,6 @@
 .pi
 .prompts
-.node_modules
+.vscode
+bun.lock
+node_modules
 

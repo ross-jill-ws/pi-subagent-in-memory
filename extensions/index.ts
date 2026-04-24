@@ -13,9 +13,15 @@
  * - Live TUI card widgets showing subagent status and output
  * - JSONL event logging to ~/.pi/subagent-in-memory/<sessionId>/
  * - Nested subagent support (subagents can spawn subagents)
- * - /in-memory-clear-widgets slash command to remove widget cards
+ * - Slash commands to control TUI overlay:
+ *     /saim-toggle-overlay [on|off]   — enable/disable rendering
+ *     /saim-set-max-tui-overlays <N>  — limit visible cards (1-9)
+ *     /saim-clear-tui-overlay         — clear all cards & close any overlay
  * - Multi-provider support (Anthropic, OpenAI, Google, etc.)
- * - Ctrl+Alt+<N> to inspect subagent prompt & live messages
+ * - Ctrl+<N> to inspect subagent prompt & live messages
+ * - Ctrl+Alt+Left / Ctrl+Alt+Right to page through cards when there are
+ *   more subagents than the visible window allows
+ * - --saim-no-tui CLI flag to start with the overlay disabled
  *
  * Results are written to ./.pi/subagent-in-memory/<mainSessionId>/subagent_<N>/result.md
  * (or error.md on failure) so the calling agent gets a short pointer instead of
@@ -24,19 +30,12 @@
 
 import { Type, type Static } from "@sinclair/typebox";
 import {
-  createAgentSession,
+  createAgentSessionFromServices,
+  createAgentSessionServices,
   SessionManager,
-  AuthStorage,
-  DefaultResourceLoader,
-  getAgentDir,
-  createCodingTools,
-  createGrepTool,
-  createFindTool,
-  createLsTool,
 } from "@mariozechner/pi-coding-agent";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-coding-agent";
-import { resolveModel } from "./model.ts";
+import type { AgentToolResult, AgentToolUpdateCallback, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { renderCard, type CardTheme } from "./tui-draw.ts";
 
 import { visibleWidth, truncateToWidth, wrapTextWithAnsi, matchesKey, Key } from "@mariozechner/pi-tui";
@@ -142,21 +141,72 @@ let widgetRenderVersion = 0;
 
 // Track open detail overlay so we can trigger re-renders
 let activeDetailTui: any = null;
+let activeDetailDone: ((result: void) => void) | null = null;
+
+// ── TUI overlay controls (commands & flag) ──────────────────────
+const DEFAULT_MAX_VISIBLE_OVERLAYS = 3;
+const MAX_OVERLAYS_HARD_LIMIT = 9;
+let overlayEnabled = true;
+let maxVisibleOverlays = DEFAULT_MAX_VISIBLE_OVERLAYS;
+// Number of cards to skip from the END of the list. 0 means "show the latest
+// `maxVisibleOverlays`". Increasing windowOffset pages back into older cards.
+let windowOffset = 0;
+
+function getVisibleSubagents(): SubagentCard[] {
+  if (subagents.length === 0) return [];
+  const total = subagents.length;
+  const window = Math.min(maxVisibleOverlays, total);
+  // Clamp offset to valid range; user paging may have left it stale.
+  const maxOffset = Math.max(0, total - window);
+  if (windowOffset > maxOffset) windowOffset = maxOffset;
+  if (windowOffset < 0) windowOffset = 0;
+  const end = total - windowOffset;
+  const start = Math.max(0, end - window);
+  return subagents.slice(start, end);
+}
+
+function unmountWidget() {
+  if (!currentCtx) return;
+  if (widgetMounted) {
+    currentCtx.ui.setWidget("in-memory-subagent-cards", undefined);
+  }
+  widgetMounted = false;
+  widgetTui = null;
+}
+
+function closeActiveDetail() {
+  if (activeDetailDone) {
+    try { activeDetailDone(); } catch {}
+  }
+  activeDetailTui = null;
+  activeDetailDone = null;
+}
 
 function renderSubagentCards(theme: any, width: number): string[] {
-  if (subagents.length === 0) return [];
+  if (!overlayEnabled) return [];
+  const visible = getVisibleSubagents();
+  if (visible.length === 0) return [];
 
   // Derive cols from columnWidthPercent (all cards share the same value).
-  const pct = subagents[subagents.length - 1].columnWidthPercent;
+  const pct = visible[visible.length - 1].columnWidthPercent;
   const cols = Math.min(3, Math.max(1, Math.round(100 / pct)));
   const gap = 1;
   const colWidth = Math.floor((width - gap * (cols - 1)) / cols);
   const maxContentLines = 4;
   const lines: string[] = [""];
 
-  for (let i = 0; i < subagents.length; i += cols) {
-    const rowCards = subagents.slice(i, i + cols).map((sa, idx) => {
-      const cardTheme = CARD_THEMES[(i + idx) % CARD_THEMES.length];
+  // Page indicator if there are more cards than fit on screen
+  const total = subagents.length;
+  if (total > visible.length) {
+    const firstVisible = total - windowOffset - visible.length + 1;
+    const lastVisible = total - windowOffset;
+    const hint = `subagents ${firstVisible}–${lastVisible} of ${total}  (Ctrl+Alt+←/→ to page)`;
+    lines.push(theme.fg("dim", truncateToWidth(hint, width)));
+  }
+
+  for (let i = 0; i < visible.length; i += cols) {
+    const rowCards = visible.slice(i, i + cols).map((sa, idx) => {
+      const cardTheme = CARD_THEMES[(sa.num - 1) % CARD_THEMES.length];
 
       const titleText = `${sa.title} [${sa.modelLabel}]`;
       const innerW = colWidth - 4;
@@ -166,8 +216,8 @@ function renderSubagentCards(theme: any, width: number): string[] {
       const trimmedLines = contentLines.map((l) =>
         visibleWidth(l) > innerW ? truncateToWidth(l, innerW - 1) + "…" : l
       );
-      const visible = trimmedLines.slice(0, maxContentLines);
-      const content = visible.join("\n") + (contentLines.length > maxContentLines ? "\n…" : "");
+      const visibleContentLines = trimmedLines.slice(0, maxContentLines);
+      const content = visibleContentLines.join("\n") + (contentLines.length > maxContentLines ? "\n…" : "");
 
       let statusRaw: string;
       if (sa.status === "created") {
@@ -286,12 +336,8 @@ function requestSubagentRender() {
   syncAnimationTimer();
 
   if (!currentCtx) return;
-  if (subagents.length === 0) {
-    if (widgetMounted) {
-      currentCtx.ui.setWidget("in-memory-subagent-cards", undefined);
-      widgetMounted = false;
-      widgetTui = null;
-    }
+  if (!overlayEnabled || subagents.length === 0) {
+    unmountWidget();
     try { activeDetailTui?.requestRender(); } catch {}
     return;
   }
@@ -477,36 +523,44 @@ async function executeSubagent(
     throw new Error("Could not determine model. Provide provider and model parameters.");
   }
 
-  const { model: resolvedModel, apiKey } = await resolveModel(providerName, modelId);
-
   const cwd = params.cwd ?? fallbackCwd ?? process.cwd();
 
-  const authStorage = AuthStorage.create();
-  authStorage.setRuntimeApiKey(providerName, apiKey);
+  // Create pi's normal cwd-bound services first. This loads packages from
+  // ~/.pi/agent/settings.json and <cwd>/.pi/settings.json, then applies any
+  // extension-provided registerProvider() calls to the model registry. Resolving
+  // the requested model after this step is what makes package-provided models
+  // such as openai-codex/gpt-5.5 visible to subagents.
+  const services = await createAgentSessionServices({ cwd });
+  const resolvedModel = services.modelRegistry.find(providerName, modelId);
+  if (!resolvedModel) {
+    const providerModels = services.modelRegistry
+      .getAll()
+      .filter((model) => model.provider === providerName)
+      .map((model) => model.id)
+      .sort();
+    const diagnostics = services.diagnostics
+      .filter((diagnostic) => diagnostic.type === "error")
+      .map((diagnostic) => diagnostic.message);
+    const details = [
+      providerModels.length > 0
+        ? `Known models for ${providerName}: ${providerModels.join(", ")}`
+        : `Provider ${providerName} has no registered models.`,
+      diagnostics.length > 0 ? `Service diagnostics: ${diagnostics.join("; ")}` : undefined,
+    ].filter(Boolean).join(" ");
+    throw new Error(`Could not find model ${providerName}/${modelId}. ${details}`.trim());
+  }
 
-  // Create tools for the subagent, including nested subagent support
-  const tools = [
-    ...createCodingTools(cwd),
-    createGrepTool(cwd),
-    createFindTool(cwd),
-    createLsTool(cwd),
-    createSubagentAgentTool(providerName, modelId, cwd),
-  ];
-
-  const resourceLoader = new DefaultResourceLoader({
-    cwd,
-    agentDir: getAgentDir(),
-  });
-  await resourceLoader.reload();
-
-  const { session } = await createAgentSession({
-    model: resolvedModel,
-    authStorage,
-    tools,
-    thinkingLevel: "off",
-    cwd,
+  const { session } = await createAgentSessionFromServices({
+    services,
     sessionManager: SessionManager.inMemory(),
-    resourceLoader,
+    model: resolvedModel,
+    thinkingLevel: "off",
+    // Keep subagent context/tool surface intentionally small: built-in coding
+    // tools plus nested subagent support. Package extensions are still loaded
+    // above so provider registrations are available, but their tools are not
+    // activated unless explicitly listed here.
+    tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent_create"],
+    customTools: [createSubagentAgentTool(providerName, modelId, cwd)],
   });
 
   // Set up JSONL event log
@@ -766,7 +820,7 @@ function createSubagentAgentTool(
   parentProvider: string,
   parentModel: string,
   parentCwd: string,
-) {
+): ToolDefinition<typeof SubagentParams> {
   return {
     name: "subagent_create",
     label: "Subagent",
@@ -779,6 +833,7 @@ function createSubagentAgentTool(
       params: SubagentParamsType,
       signal?: AbortSignal,
       onUpdate?: AgentToolUpdateCallback,
+      _ctx?: any,
     ) {
       return executeSubagent(
         toolCallId,
@@ -795,46 +850,142 @@ function createSubagentAgentTool(
 
 // ── Extension entry point ───────────────────────────────────────
 export default function (pi: ExtensionAPI) {
+  pi.registerFlag("saim-no-tui", {
+    description: "Start with the subagent TUI overlay disabled (equivalent to /saim-toggle-overlay off).",
+    type: "boolean",
+    default: false,
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     currentCtx = ctx;
     mainSessionId = ctx.sessionManager.getSessionId?.() ?? `session-${Date.now()}`;
     subagentCount = 0;
     subagents.length = 0;
     activeDetailTui = null;
+    activeDetailDone = null;
     widgetMounted = false;
     widgetTui = null;
+    windowOffset = 0;
     if (flashTimer) { clearInterval(flashTimer); flashTimer = null; }
     ctx.ui.setWidget("in-memory-subagent-cards", undefined);
+
+    // Apply --saim-no-tui flag if present
+    if (pi.getFlag("saim-no-tui") === true) {
+      overlayEnabled = false;
+    }
+
     requestSubagentRender();
   });
 
-  pi.registerCommand("in-memory-clear-widgets", {
-    description: "Clear all in-memory subagent card widgets",
+  pi.registerCommand("saim-clear-tui-overlay", {
+    description: "Clear subagent TUI cards and close any open detail overlay",
     handler: async (_args, ctx) => {
       subagents.length = 0;
-      activeDetailTui = null;
-      widgetMounted = false;
-      widgetTui = null;
+      windowOffset = 0;
+      closeActiveDetail();
+      unmountWidget();
       if (flashTimer) { clearInterval(flashTimer); flashTimer = null; }
-      ctx.ui.setWidget("in-memory-subagent-cards", undefined);
-      ctx.ui.notify("In-memory subagent widgets cleared", "info");
+      ctx.ui.notify("Subagent TUI cards cleared", "info");
     },
   });
 
-  // Register Ctrl+1 through Ctrl+9 to open subagent detail overlay
+  pi.registerCommand("saim-toggle-overlay", {
+    description: "Enable or disable subagent detail overlays. Usage: /saim-toggle-overlay [on|off|toggle]",
+    handler: async (args, ctx) => {
+      const arg = (args ?? "").trim().toLowerCase();
+      let next: boolean;
+      if (arg === "on" || arg === "true" || arg === "1") {
+        next = true;
+      } else if (arg === "off" || arg === "false" || arg === "0") {
+        next = false;
+      } else if (arg === "" || arg === "toggle") {
+        next = !overlayEnabled;
+      } else {
+        ctx.ui.notify(`Unknown argument "${arg}". Use on, off, or toggle.`, "warning");
+        return;
+      }
+      overlayEnabled = next;
+      if (!overlayEnabled) {
+        // Force-tear down even while subagents are running.
+        closeActiveDetail();
+        unmountWidget();
+      }
+      requestSubagentRender();
+      ctx.ui.notify(`Subagent TUI overlay ${overlayEnabled ? "enabled" : "disabled"}`, "info");
+    },
+  });
+
+  pi.registerCommand("saim-set-max-tui-overlays", {
+    description: `Set max visible subagent cards (1-${MAX_OVERLAYS_HARD_LIMIT}). Older cards remain accessible via Ctrl+Alt+←/→.`,
+    handler: async (args, ctx) => {
+      const n = parseInt((args ?? "").trim(), 10);
+      if (!Number.isFinite(n) || n < 1 || n > MAX_OVERLAYS_HARD_LIMIT) {
+        ctx.ui.notify(
+          `Provide an integer between 1 and ${MAX_OVERLAYS_HARD_LIMIT}.`,
+          "warning",
+        );
+        return;
+      }
+      maxVisibleOverlays = n;
+      windowOffset = 0;
+      requestSubagentRender();
+      ctx.ui.notify(`Max visible subagent cards set to ${n}`, "info");
+    },
+  });
+
+  // Page through cards when there are more subagents than fit on screen.
+  pi.registerShortcut(Key.ctrlAlt("left"), {
+    description: "Page to older subagent cards",
+    handler: async (ctx) => {
+      if (!overlayEnabled) return;
+      const total = subagents.length;
+      const window = Math.min(maxVisibleOverlays, total);
+      const maxOffset = Math.max(0, total - window);
+      if (windowOffset >= maxOffset) {
+        ctx.ui.notify("Already showing the oldest subagents", "info");
+        return;
+      }
+      windowOffset = Math.min(maxOffset, windowOffset + window);
+      requestSubagentRender();
+    },
+  });
+
+  pi.registerShortcut(Key.ctrlAlt("right"), {
+    description: "Page to newer subagent cards",
+    handler: async (ctx) => {
+      if (!overlayEnabled) return;
+      if (windowOffset === 0) {
+        ctx.ui.notify("Already showing the latest subagents", "info");
+        return;
+      }
+      const window = Math.min(maxVisibleOverlays, subagents.length);
+      windowOffset = Math.max(0, windowOffset - window);
+      requestSubagentRender();
+    },
+  });
+
+  // Register Ctrl+1 through Ctrl+9 to open subagent detail overlay.
+  // The number maps to the position WITHIN the currently visible window
+  // (1 = first visible card), not the absolute subagent number.
   for (let n = 1; n <= 9; n++) {
     pi.registerShortcut(Key.ctrl(`${n}` as any), {
-      description: `Inspect subagent #${n}`,
+      description: `Inspect visible subagent #${n}`,
       handler: async (ctx) => {
-        const card = subagents.find((sa) => sa.num === n);
+        if (!overlayEnabled) {
+          ctx.ui.notify("Subagent TUI overlay is disabled", "warning");
+          return;
+        }
+        const visible = getVisibleSubagents();
+        const card = visible[n - 1];
         if (!card) {
-          ctx.ui.notify(`No subagent #${n}`, "warning");
+          ctx.ui.notify(`No visible subagent #${n}`, "warning");
           return;
         }
 
         await ctx.ui.custom<void>(
           (tui: any, theme: any, _keybindings: any, done: (result: void) => void) => {
             activeDetailTui = tui;
+            activeDetailDone = done;
             return new SubagentDetailOverlay(card, n, theme, done);
           },
           {
@@ -849,6 +1000,7 @@ export default function (pi: ExtensionAPI) {
         );
 
         activeDetailTui = null;
+        activeDetailDone = null;
         syncAnimationTimer();
         requestSubagentRender();
       },

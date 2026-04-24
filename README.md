@@ -40,11 +40,19 @@ Each running subagent is displayed as a colored card widget above the editor:
 
 ### 🔍 Subagent Detail Overlay (`Ctrl+N`)
 
-Press **Ctrl+1** through **Ctrl+9** to open a detail popup for the corresponding subagent:
+Press **Ctrl+1** through **Ctrl+9** to open a detail popup for the **N-th visible** subagent card (1 = leftmost/topmost in the current window):
 
 - **Prompt** — Full prompt text with word wrapping (up to 5 lines)
 - **Messages** — Live-updating stream of the subagent's activity (text output, tool calls, status changes), always showing the latest 5 lines
 - Press the same **Ctrl+N** shortcut or **Escape** to close the overlay
+
+### 📑 Paging Through Cards (`Ctrl+Alt+←/→`)
+
+When more subagents have been spawned than fit in the visible window (see `/saim-set-max-tui-overlays` below):
+
+- **Ctrl+Alt+←** scrolls back to older subagent cards
+- **Ctrl+Alt+→** scrolls forward to newer subagent cards
+- A `subagents X–Y of N (Ctrl+Alt+←/→ to page)` hint is displayed above the cards whenever paging is active
 
 ### 📝 JSONL Session Logging
 
@@ -71,9 +79,17 @@ The JSONL log includes:
 
 Subagents can spawn their own subagents. All nested cards render in the main agent's widget — they share the same module-level state regardless of nesting depth. This is achieved by passing the `subagent_create` tool directly as an `AgentTool` to child sessions.
 
-### 🧹 `/in-memory-clear-widgets` Slash Command
+### 🎛️ TUI Overlay Slash Commands
 
-Type `/in-memory-clear-widgets` in the pi prompt to clear all subagent card widgets from the TUI. Useful after a batch of subagent runs when you want a clean view.
+| Command | Description |
+|---------|-------------|
+| `/saim-toggle-overlay [on\|off\|toggle]` | Enable, disable, or toggle the subagent TUI overlay. When disabled, **no card widget is mounted even while subagents are actively running** — they continue executing silently in the background. |
+| `/saim-set-max-tui-overlays <N>` | Set the maximum number of cards displayed at once (1–9, default 3). Older cards remain accessible via **Ctrl+Alt+←/→**. |
+| `/saim-clear-tui-overlay` | Clear all subagent cards from the TUI and close any open detail overlay. |
+
+### 🚩 `--saim-no-tui` CLI Flag
+
+Start `pi` with `--saim-no-tui` to launch with the subagent overlay disabled (equivalent to running `/saim-toggle-overlay off` immediately on startup). Subagents still run normally — only the TUI cards are hidden.
 
 ## Install
 
@@ -92,7 +108,7 @@ pi remove npm:pi-subagent-in-memory
 After installing, start pi and check:
 
 1. The `subagent_create` tool should appear in the tool list
-2. The `/in-memory-clear-widgets` command should be available (type `/` to see commands)
+2. The `/saim-toggle-overlay`, `/saim-set-max-tui-overlays`, and `/saim-clear-tui-overlay` commands should be available (type `/` to see commands)
 3. Ask the agent to "run a subagent to list files" — you should see a card widget appear
 
 ## Usage Examples
@@ -118,7 +134,7 @@ Once installed, the LLM will discover the `subagent_create` tool from its schema
 
 ## How It Works
 
-1. **Tool registration** — On load, registers `subagent_create` as a tool and `/in-memory-clear-widgets` as a command. No system prompt modifications.
+1. **Tool registration** — On load, registers `subagent_create` as a tool plus the `/saim-*` commands and `--saim-no-tui` flag. No system prompt modifications.
 2. **Session creation** — When the LLM calls `subagent_create`, a new `createAgentSession` is created in-process with its own model, auth, and coding tools (read, write, edit, bash, grep, find, ls).
 3. **Event streaming** — All subagent events (text deltas, tool calls, completions) are forwarded as `tool_execution_update` events to the parent agent and logged to JSONL.
 4. **Widget rendering** — A TUI widget renders card(s) above the editor, updated on every event.
