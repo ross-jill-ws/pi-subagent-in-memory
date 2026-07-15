@@ -23,10 +23,24 @@ Spawns an in-process subagent session using pi's `createAgentSession` SDK. The s
 | `provider` | string | | LLM provider (e.g. `anthropic`, `google`, `openai`) |
 | `model` | string | | Model ID. Supports `provider/model` format (e.g. `openai/gpt-4o-mini`) |
 | `cwd` | string | | Working directory for the subagent |
-| `timeout` | number | | Timeout in seconds. Aborts the subagent if exceeded |
+| `timeout` | number | | Timeout in seconds. Aborts the subagent if exceeded. Defaults to the configured default timeout (300s, see `/saim-timeout`) |
 | `columnWidthPercent` | number | | Card width as % of terminal (33–100). Controls card grid layout |
 
 If `provider` and `model` are omitted, the subagent inherits the main agent's model.
+
+### ⏱️ Timeouts That Don't Destroy Child Work
+
+Every subagent has a timeout (default **300s**, configurable via `--saim-timeout` / `/saim-timeout`, `0` = unlimited). When a parent agent is aborted or times out while a child subagent is still running, the child is **not killed**. Instead it detaches:
+
+- The parent's tool call returns immediately with a note that the child continues in the background
+- The child keeps running, still bounded by its **own** timeout
+- When it finishes, its output is written to `result.md` (or `error.md` on failure) as usual, so the work can be harvested later
+
+On any failure (timeout, error), whatever text the subagent had already produced is salvaged to `partial-result.md` alongside `error.md` — nothing is silently discarded.
+
+### 🛑 Nesting Depth Limit
+
+Subagents may spawn their own subagents, but only up to a configured max depth (default **2**: main agent → subagent → sub-subagent). Subagents at the max depth don't receive the `subagent_create` tool at all, so a runaway fork cascade is structurally impossible. Configure via `--saim-max-depth` / `/saim-max-depth` (1–10).
 
 ### 📊 Live TUI Card Widgets
 
@@ -61,11 +75,12 @@ Every subagent session is logged to disk for debugging and auditing:
 ```
 .pi/subagent-in-memory/<mainSessionId>/
 ├── subagent_1/
-│   ├── events.jsonl    # Full event stream (text, tool calls, results)
-│   └── result.md       # Final subagent output (or error.md on failure)
+│   ├── events.jsonl        # Full event stream (text, tool calls, results)
+│   └── result.md           # Final subagent output
 ├── subagent_2/
 │   ├── events.jsonl
-│   └── result.md
+│   ├── error.md            # On failure: what went wrong
+│   └── partial-result.md   # On failure: any text produced before the failure
 └── ...
 ```
 
@@ -77,19 +92,25 @@ The JSONL log includes:
 
 ### 🔄 Nested Subagent Support
 
-Subagents can spawn their own subagents. All nested cards render in the main agent's widget — they share the same module-level state regardless of nesting depth. This is achieved by passing the `subagent_create` tool directly as an `AgentTool` to child sessions.
+Subagents can spawn their own subagents, up to the configured max depth (see above). All nested cards render in the main agent's widget — they share the same module-level state regardless of nesting depth. This is achieved by passing the `subagent_create` tool directly as an `AgentTool` to child sessions.
 
-### 🎛️ TUI Overlay Slash Commands
+### 🎛️ Slash Commands
 
 | Command | Description |
 |---------|-------------|
+| `/saim-max-depth [n]` | Show or set the max subagent nesting depth (1–10, default 2). Applies to newly created subagents. |
+| `/saim-timeout [seconds]` | Show or set the default subagent timeout in seconds (default 300, `0` = unlimited). A per-call `timeout` parameter overrides it. |
 | `/saim-toggle-overlay [on\|off\|toggle]` | Enable, disable, or toggle the subagent TUI overlay. When disabled, **no card widget is mounted even while subagents are actively running** — they continue executing silently in the background. |
 | `/saim-set-max-tui-overlays <N>` | Set the maximum number of cards displayed at once (1–9, default 3). Older cards remain accessible via **Ctrl+Alt+←/→**. |
 | `/saim-clear-tui-overlay` | Clear all subagent cards from the TUI and close any open detail overlay. |
 
-### 🚩 `--saim-no-tui` CLI Flag
+### 🚩 CLI Flags
 
-Start `pi` with `--saim-no-tui` to launch with the subagent overlay disabled (equivalent to running `/saim-toggle-overlay off` immediately on startup). Subagents still run normally — only the TUI cards are hidden.
+| Flag | Description |
+|------|-------------|
+| `--saim-max-depth <n>` | Max subagent nesting depth (1–10, default 2). Same as `/saim-max-depth`. |
+| `--saim-timeout <seconds>` | Default subagent timeout in seconds (default 300, `0` = unlimited). Same as `/saim-timeout`. |
+| `--saim-no-tui` | Start with the subagent overlay disabled (equivalent to running `/saim-toggle-overlay off` immediately on startup). Subagents still run normally — only the TUI cards are hidden. |
 
 ## Install
 
@@ -108,7 +129,7 @@ pi remove npm:pi-subagent-in-memory
 After installing, start pi and check:
 
 1. The `subagent_create` tool should appear in the tool list
-2. The `/saim-toggle-overlay`, `/saim-set-max-tui-overlays`, and `/saim-clear-tui-overlay` commands should be available (type `/` to see commands)
+2. The `/saim-max-depth`, `/saim-timeout`, `/saim-toggle-overlay`, `/saim-set-max-tui-overlays`, and `/saim-clear-tui-overlay` commands should be available (type `/` to see commands)
 3. Ask the agent to "run a subagent to list files" — you should see a card widget appear
 
 ## Usage Examples

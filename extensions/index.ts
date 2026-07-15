@@ -17,6 +17,13 @@
  *     /saim-toggle-overlay [on|off]   — enable/disable rendering
  *     /saim-set-max-tui-overlays <N>  — limit visible cards (1-9)
  *     /saim-clear-tui-overlay         — clear all cards & close any overlay
+ * - Runtime limits (each also available as a CLI flag):
+ *     /saim-max-depth [n]             — max subagent nesting depth (default 2)
+ *     /saim-timeout [seconds]         — default subagent timeout (default 300s,
+ *                                       0 = unlimited)
+ * - Parent aborts/timeouts do NOT kill running children: the child detaches,
+ *   keeps running under its own timeout, and still writes result.md /
+ *   error.md (plus partial-result.md salvaging any text produced so far).
  * - Multi-provider support (Anthropic, OpenAI, Google, etc.)
  * - Ctrl+<N> to inspect subagent prompt & live messages
  * - Ctrl+Alt+Left / Ctrl+Alt+Right to page through cards when there are
@@ -142,6 +149,33 @@ let widgetRenderVersion = 0;
 // Track open detail overlay so we can trigger re-renders
 let activeDetailTui: any = null;
 let activeDetailDone: ((result: void) => void) | null = null;
+
+// ── Runtime limits (commands & flags) ───────────────────────────
+const DEFAULT_MAX_DEPTH = 2;
+const MAX_DEPTH_HARD_LIMIT = 10;
+const DEFAULT_TIMEOUT_SECS = 300;
+// Max nesting depth: 1 = only the main agent may spawn subagents,
+// 2 = subagents may spawn one further level, etc. Prevents runaway forks.
+let maxSubagentDepth = DEFAULT_MAX_DEPTH;
+// Default per-subagent timeout in seconds, used when a subagent_create call
+// doesn't pass `timeout` explicitly. 0 = unlimited.
+let defaultTimeoutSecs = DEFAULT_TIMEOUT_SECS;
+
+/** Thrown into the tool-call promise when the PARENT aborts, so the child can
+ * detach and keep running instead of being killed mid-flight. */
+class ParentAbortedError extends Error {
+  constructor() {
+    super("Subagent was aborted by parent");
+  }
+}
+
+function parseIntSetting(raw: unknown): number | undefined {
+  if (typeof raw !== "string") return undefined;
+  const trimmed = raw.trim();
+  if (trimmed === "") return undefined;
+  const n = Number(trimmed);
+  return Number.isInteger(n) ? n : Number.NaN;
+}
 
 // ── TUI overlay controls (commands & flag) ──────────────────────
 const DEFAULT_MAX_VISIBLE_OVERLAYS = 3;
@@ -477,8 +511,9 @@ const SubagentParams = Type.Object({
   timeout: Type.Optional(
     Type.Number({
       description:
-        "Timeout in seconds for the subagent execution. If exceeded, the subagent is aborted. " +
-        "Defaults to unlimited (no timeout).",
+        "Timeout in seconds for the subagent execution. If exceeded, the subagent is aborted " +
+        "(its own in-flight nested subagents keep running and still write their results). " +
+        "Defaults to the configured default timeout (300s unless changed via --saim-timeout or /saim-timeout).",
       minimum: 1,
     })
   ),
@@ -504,7 +539,18 @@ async function executeSubagent(
   fallbackProvider?: string,
   fallbackModel?: string,
   fallbackCwd?: string,
+  depth: number = 1,
 ): Promise<AgentToolResult<any>> {
+  if (depth > maxSubagentDepth) {
+    throw new Error(
+      `Subagent nesting depth limit reached (max depth ${maxSubagentDepth}, see /saim-max-depth). ` +
+        "Perform the task directly instead of delegating to another subagent.",
+    );
+  }
+  if (signal?.aborted) {
+    throw new Error("Subagent was aborted before it started");
+  }
+
   subagentCount++;
   const subagentNum = subagents.length + 1; // display number based on currently visible cards
   const outDir = join(".pi", "subagent-in-memory", mainSessionId, `subagent_${subagentCount}`);
@@ -550,6 +596,9 @@ async function executeSubagent(
     throw new Error(`Could not find model ${providerName}/${modelId}. ${details}`.trim());
   }
 
+  // Subagents at the max depth don't get the subagent_create tool at all, so
+  // the LLM can't even attempt a deeper fork.
+  const canNest = depth < maxSubagentDepth;
   const { session } = await createAgentSessionFromServices({
     services,
     sessionManager: SessionManager.inMemory(),
@@ -559,8 +608,10 @@ async function executeSubagent(
     // tools plus nested subagent support. Package extensions are still loaded
     // above so provider registrations are available, but their tools are not
     // activated unless explicitly listed here.
-    tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent_create"],
-    customTools: [createSubagentAgentTool(providerName, modelId, cwd)],
+    tools: canNest
+      ? ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent_create"]
+      : ["read", "bash", "edit", "write", "grep", "find", "ls"],
+    customTools: canNest ? [createSubagentAgentTool(providerName, modelId, cwd, depth + 1)] : [],
   });
 
   // Set up JSONL event log
@@ -576,6 +627,7 @@ async function executeSubagent(
     model: modelId,
     task: params.task,
     title: params.title,
+    depth,
   });
   let lastEventId = session.sessionId;
 
@@ -599,26 +651,21 @@ async function executeSubagent(
     details: { sessionId: session.sessionId, status: "created" },
   });
 
-  // Timeout handling
+  // Timeout handling — explicit params.timeout wins, otherwise the configured
+  // default applies. 0 means unlimited.
+  const timeoutSecs = params.timeout ?? defaultTimeoutSecs;
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
   const timeoutController = new AbortController();
-  if (params.timeout) {
+  if (timeoutSecs > 0) {
     timeoutTimer = setTimeout(() => {
       timeoutController.abort();
-    }, params.timeout * 1000);
+    }, timeoutSecs * 1000);
   }
 
-  const combinedAbort = () => {
-    session.abort();
-    card.status = "error";
-    card.endedAt = Date.now();
-    appendMessage(card, "[aborted]");
-    requestSubagentRender();
-  };
+  // Hoisted out of the run promise so error paths can salvage partial output.
+  let finalText = "";
 
-  try {
-    const result = await new Promise<string>((resolve, reject) => {
-      let finalText = "";
+  const runPromise = new Promise<string>((resolve, reject) => {
       let textDeltaBuffer = "";
       let toolcallDeltaBuffer = "";
       let lastPartialUpdateAt = 0;
@@ -768,15 +815,17 @@ async function executeSubagent(
         }
       });
 
-      if (signal) {
-        signal.addEventListener("abort", () => {
-          combinedAbort();
-          reject(new Error("Subagent was aborted"));
-        });
-      }
       timeoutController.signal.addEventListener("abort", () => {
-        combinedAbort();
-        reject(new Error(`Subagent timed out after ${params.timeout}s`));
+        // Abort only this subagent's own session. Its in-flight nested
+        // subagents receive the abort as a PARENT abort and detach instead of
+        // dying (see ParentAbortedError handling below), so their work is
+        // still written to disk.
+        session.abort();
+        card.status = "error";
+        card.endedAt = Date.now();
+        appendMessage(card, `[timed out after ${timeoutSecs}s]`);
+        requestSubagentRender();
+        reject(new Error(`Subagent timed out after ${timeoutSecs}s`));
       });
 
       session.prompt(params.task).catch((err) => {
@@ -786,30 +835,85 @@ async function executeSubagent(
         requestSubagentRender();
         reject(err);
       });
-    });
+  });
 
+  const finalizeSuccess = async (result: string): Promise<string> => {
     if (timeoutTimer) clearTimeout(timeoutTimer);
     session.dispose();
     await flushJsonl(jsonlPath);
-
     const resultPath = join(outDir, "result.md");
     writeFileSync(resultPath, result, "utf-8");
+    return resultPath;
+  };
 
+  const finalizeError = async (err: any): Promise<{ errorPath: string; partialPath?: string }> => {
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    session.dispose();
+    await flushJsonl(jsonlPath);
+    const errorMsg = err?.message ?? String(err);
+    const errorPath = join(outDir, "error.md");
+    let body = `# Subagent Error\n\n${errorMsg}\n`;
+    let partialPath: string | undefined;
+    if (finalText.trim()) {
+      partialPath = join(outDir, "partial-result.md");
+      writeFileSync(partialPath, finalText, "utf-8");
+      body += `\nPartial output produced before the failure was saved to \`partial-result.md\`.\n`;
+    }
+    writeFileSync(errorPath, body, "utf-8");
+    return { errorPath, partialPath };
+  };
+
+  // A parent abort races against the run instead of killing the session, so
+  // a timed-out/aborted parent can no longer destroy useful child work.
+  let parentAbortPromise: Promise<never> | undefined;
+  if (signal) {
+    parentAbortPromise = new Promise<never>((_, reject) => {
+      signal.addEventListener("abort", () => reject(new ParentAbortedError()), { once: true });
+    });
+  }
+
+  try {
+    const result = await (parentAbortPromise ? Promise.race([runPromise, parentAbortPromise]) : runPromise);
+    const resultPath = await finalizeSuccess(result);
     return {
       content: [{ type: "text", text: `Execution succeeded. Result is in \`${resultPath}\`` }],
       details: { sessionId: session.sessionId, status: "completed", outputDir: outDir },
     };
   } catch (err: any) {
-    if (timeoutTimer) clearTimeout(timeoutTimer);
-    session.dispose();
-    await flushJsonl(jsonlPath);
+    if (err instanceof ParentAbortedError) {
+      // The parent aborted (typically because it hit its own timeout) while
+      // this subagent was still working. Don't kill it — detach: let it run
+      // to completion, still bounded by its own timeout, and write result.md
+      // / error.md as usual so the work can be harvested later.
+      appendMessage(card, "[parent aborted — continuing detached]");
+      requestSubagentRender();
+      runPromise
+        .then((result) => finalizeSuccess(result))
+        .catch((e) => finalizeError(e))
+        .catch(() => {});
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              "Subagent was aborted by its parent but continues running detached (its own timeout still applies). " +
+              `Its result will be written to \`${outDir}\` when it finishes.`,
+          },
+        ],
+        details: { sessionId: session.sessionId, status: "detached", outputDir: outDir },
+      };
+    }
 
-    const errorMsg = err?.message ?? String(err);
-    const errorPath = join(outDir, "error.md");
-    writeFileSync(errorPath, `# Subagent Error\n\n${errorMsg}\n`, "utf-8");
-
+    const { errorPath, partialPath } = await finalizeError(err);
     return {
-      content: [{ type: "text", text: `Execution failed. Detail is in \`${errorPath}\`` }],
+      content: [
+        {
+          type: "text",
+          text:
+            `Execution failed. Detail is in \`${errorPath}\`` +
+            (partialPath ? ` (partial output in \`${partialPath}\`)` : ""),
+        },
+      ],
       details: { sessionId: session.sessionId, status: "error", outputDir: outDir },
     };
   }
@@ -820,13 +924,15 @@ function createSubagentAgentTool(
   parentProvider: string,
   parentModel: string,
   parentCwd: string,
+  childDepth: number,
 ): ToolDefinition<typeof SubagentParams> {
   return {
     name: "subagent_create",
     label: "Subagent",
     description:
       "Create a subagent to perform a task. The subagent runs in-process with its own session. " +
-      "Progress is streamed back as execution updates. Returns the final result when the subagent finishes.",
+      "Progress is streamed back as execution updates. Returns the final result when the subagent finishes. " +
+      "Nesting is limited to a configured max depth — if the limit is reached, do the work directly instead.",
     parameters: SubagentParams,
     async execute(
       toolCallId: string,
@@ -843,6 +949,7 @@ function createSubagentAgentTool(
         parentProvider,
         parentModel,
         parentCwd,
+        childDepth,
       );
     },
   };
@@ -854,6 +961,16 @@ export default function (pi: ExtensionAPI) {
     description: "Start with the subagent TUI overlay disabled (equivalent to /saim-toggle-overlay off).",
     type: "boolean",
     default: false,
+  });
+
+  pi.registerFlag("saim-max-depth", {
+    description: `Max subagent nesting depth, 1-${MAX_DEPTH_HARD_LIMIT} (default ${DEFAULT_MAX_DEPTH}). Prevents runaway subagent forks.`,
+    type: "string",
+  });
+
+  pi.registerFlag("saim-timeout", {
+    description: `Default subagent timeout in seconds, 0 = unlimited (default ${DEFAULT_TIMEOUT_SECS}). Per-call \`timeout\` parameter overrides it.`,
+    type: "string",
   });
 
   pi.on("session_start", async (_event, ctx) => {
@@ -874,7 +991,68 @@ export default function (pi: ExtensionAPI) {
       overlayEnabled = false;
     }
 
+    // Apply --saim-max-depth / --saim-timeout flags if present
+    const depthFlag = parseIntSetting(pi.getFlag("saim-max-depth"));
+    if (depthFlag !== undefined) {
+      if (Number.isInteger(depthFlag) && depthFlag >= 1 && depthFlag <= MAX_DEPTH_HARD_LIMIT) {
+        maxSubagentDepth = depthFlag;
+      } else {
+        ctx.ui.notify(
+          `Invalid --saim-max-depth (expected 1-${MAX_DEPTH_HARD_LIMIT}); keeping ${maxSubagentDepth}`,
+          "warning",
+        );
+      }
+    }
+    const timeoutFlag = parseIntSetting(pi.getFlag("saim-timeout"));
+    if (timeoutFlag !== undefined) {
+      if (Number.isInteger(timeoutFlag) && timeoutFlag >= 0) {
+        defaultTimeoutSecs = timeoutFlag;
+      } else {
+        ctx.ui.notify(
+          `Invalid --saim-timeout (expected seconds >= 0); keeping ${defaultTimeoutSecs}`,
+          "warning",
+        );
+      }
+    }
+
     requestSubagentRender();
+  });
+
+  pi.registerCommand("saim-max-depth", {
+    description: `Show or set max subagent nesting depth (1-${MAX_DEPTH_HARD_LIMIT}, default ${DEFAULT_MAX_DEPTH}). Usage: /saim-max-depth [n]`,
+    handler: async (args, ctx) => {
+      const arg = (args ?? "").trim();
+      if (arg === "") {
+        ctx.ui.notify(`Max subagent nesting depth: ${maxSubagentDepth}`, "info");
+        return;
+      }
+      const n = Number(arg);
+      if (!Number.isInteger(n) || n < 1 || n > MAX_DEPTH_HARD_LIMIT) {
+        ctx.ui.notify(`Provide an integer between 1 and ${MAX_DEPTH_HARD_LIMIT}.`, "warning");
+        return;
+      }
+      maxSubagentDepth = n;
+      ctx.ui.notify(`Max subagent nesting depth set to ${n} (applies to newly created subagents)`, "info");
+    },
+  });
+
+  pi.registerCommand("saim-timeout", {
+    description: `Show or set the default subagent timeout in seconds (0 = unlimited, default ${DEFAULT_TIMEOUT_SECS}). Usage: /saim-timeout [seconds]`,
+    handler: async (args, ctx) => {
+      const arg = (args ?? "").trim();
+      const fmt = (secs: number) => (secs === 0 ? "unlimited" : `${secs}s`);
+      if (arg === "") {
+        ctx.ui.notify(`Default subagent timeout: ${fmt(defaultTimeoutSecs)}`, "info");
+        return;
+      }
+      const n = Number(arg);
+      if (!Number.isInteger(n) || n < 0) {
+        ctx.ui.notify("Provide a non-negative integer number of seconds (0 = unlimited).", "warning");
+        return;
+      }
+      defaultTimeoutSecs = n;
+      ctx.ui.notify(`Default subagent timeout set to ${fmt(n)} (applies to newly created subagents)`, "info");
+    },
   });
 
   pi.registerCommand("saim-clear-tui-overlay", {
@@ -1012,7 +1190,8 @@ export default function (pi: ExtensionAPI) {
     label: "Subagent",
     description:
       "Create a subagent to perform a task. The subagent runs in-process with its own session. " +
-      "Progress is streamed back as execution updates. Returns the final result when the subagent finishes.",
+      "Progress is streamed back as execution updates. Returns the final result when the subagent finishes. " +
+      "Nesting is limited to a configured max depth — if the limit is reached, do the work directly instead.",
     parameters: SubagentParams,
 
     async execute(toolCallId, params, signal, onUpdate, ctx) {
@@ -1029,6 +1208,7 @@ export default function (pi: ExtensionAPI) {
         providerName,
         modelId,
         cwd,
+        1,
       );
     },
   });
