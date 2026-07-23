@@ -22,6 +22,7 @@ Spawns an in-process subagent session using pi's `createAgentSession` SDK. The s
 | `title` | string | | Display title for the card widget |
 | `provider` | string | | LLM provider (e.g. `anthropic`, `google`, `openai`) |
 | `model` | string | | Model ID. Supports `provider/model` format (e.g. `openai/gpt-4o-mini`) |
+| `thinkingLevel` | string | | Reasoning effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Defaults to `off` |
 | `cwd` | string | | Working directory for the subagent |
 | `timeout` | number | | Timeout in seconds. Aborts the subagent if exceeded. Defaults to the configured default timeout (300s, see `/saim-timeout`) |
 | `columnWidthPercent` | number | | Card width as % of terminal (33–100). Controls card grid layout |
@@ -143,8 +144,8 @@ Once installed, the LLM will discover the `subagent_create` tool from its schema
 # Parallel subagents
 "Run 2 subagents in parallel: one to summarize src/ and another to summarize tests/"
 
-# Different models
-"Use a subagent with openai/gpt-4o-mini to review the README"
+# Different models and reasoning effort
+"Use a subagent with openai/gpt-4o-mini and medium thinking to review the README"
 
 # With timeout
 "Spawn a subagent with a 60-second timeout to count lines of code"

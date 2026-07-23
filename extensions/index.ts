@@ -505,6 +505,13 @@ const SubagentParams = Type.Object({
   model: Type.Optional(
     Type.String({ description: "Model ID (e.g. 'claude-sonnet-4-5'). Defaults to the main agent's model." })
   ),
+  thinkingLevel: Type.Optional(
+    Type.Unsafe<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max">({
+      type: "string",
+      enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"],
+      description: "Reasoning effort for the subagent. Defaults to 'off'.",
+    })
+  ),
   cwd: Type.Optional(
     Type.String({ description: "Working directory for the subagent. Defaults to the main agent's cwd." })
   ),
@@ -573,15 +580,14 @@ async function executeSubagent(
 
   // Create pi's normal cwd-bound services first. This loads packages from
   // ~/.pi/agent/settings.json and <cwd>/.pi/settings.json, then applies any
-  // extension-provided registerProvider() calls to the model registry. Resolving
+  // extension-provided registerProvider() calls to the model runtime. Resolving
   // the requested model after this step is what makes package-provided models
   // such as openai-codex/gpt-5.5 visible to subagents.
   const services = await createAgentSessionServices({ cwd });
-  const resolvedModel = services.modelRegistry.find(providerName, modelId);
+  const resolvedModel = services.modelRuntime.getModel(providerName, modelId);
   if (!resolvedModel) {
-    const providerModels = services.modelRegistry
-      .getAll()
-      .filter((model) => model.provider === providerName)
+    const providerModels = services.modelRuntime
+      .getModels(providerName)
       .map((model) => model.id)
       .sort();
     const diagnostics = services.diagnostics
@@ -603,7 +609,7 @@ async function executeSubagent(
     services,
     sessionManager: SessionManager.inMemory(),
     model: resolvedModel,
-    thinkingLevel: "off",
+    thinkingLevel: params.thinkingLevel ?? "off",
     // Keep subagent context/tool surface intentionally small: built-in coding
     // tools plus nested subagent support. Package extensions are still loaded
     // above so provider registrations are available, but their tools are not
@@ -625,6 +631,7 @@ async function executeSubagent(
     cwd,
     provider: providerName,
     model: modelId,
+    thinkingLevel: params.thinkingLevel ?? "off",
     task: params.task,
     title: params.title,
     depth,
