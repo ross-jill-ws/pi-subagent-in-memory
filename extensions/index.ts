@@ -19,7 +19,7 @@
  *     /saim-clear-tui-overlay         — clear all cards & close any overlay
  * - Runtime limits (each also available as a CLI flag):
  *     /saim-max-depth [n]             — max subagent nesting depth (default 2)
- *     /saim-timeout [seconds]         — default subagent timeout (default 300s,
+ *     /saim-timeout [seconds]         — default subagent timeout (default 900s,
  *                                       0 = unlimited)
  * - Parent aborts/timeouts do NOT kill running children: the child detaches,
  *   keeps running under its own timeout, and still writes result.md /
@@ -153,7 +153,7 @@ let activeDetailDone: ((result: void) => void) | null = null;
 // ── Runtime limits (commands & flags) ───────────────────────────
 const DEFAULT_MAX_DEPTH = 2;
 const MAX_DEPTH_HARD_LIMIT = 10;
-const DEFAULT_TIMEOUT_SECS = 300;
+const DEFAULT_TIMEOUT_SECS = 900;
 // Max nesting depth: 1 = only the main agent may spawn subagents,
 // 2 = subagents may spawn one further level, etc. Prevents runaway forks.
 let maxSubagentDepth = DEFAULT_MAX_DEPTH;
@@ -520,7 +520,7 @@ const SubagentParams = Type.Object({
       description:
         "Timeout in seconds for the subagent execution. If exceeded, the subagent is aborted " +
         "(its own in-flight nested subagents keep running and still write their results). " +
-        "Defaults to the configured default timeout (300s unless changed via --saim-timeout or /saim-timeout).",
+        "Defaults to the configured default timeout (900s unless changed via --saim-timeout or /saim-timeout).",
       minimum: 1,
     })
   ),
