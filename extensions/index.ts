@@ -136,6 +136,14 @@ function appendMessageChunk(card: SubagentCard, chunk: string) {
   trimCardMessages(card);
 }
 
+/** Tail of the card's activity stream, used to make result.md/error.md
+ * self-describing when the subagent produced little or no final text. */
+function activityTail(card: SubagentCard, maxChars = 2_000): string {
+  const text = card.messages.trim();
+  if (!text) return "(no recorded activity)";
+  return text.length > maxChars ? `…${text.slice(-maxChars)}` : text;
+}
+
 // ── Shared state — single instance across all nesting levels ────
 const subagents: SubagentCard[] = [];
 let currentCtx: { ui: any } | null = null;
@@ -602,6 +610,11 @@ async function executeSubagent(
     throw new Error(`Could not find model ${providerName}/${modelId}. ${details}`.trim());
   }
 
+  // Timeout handling — explicit params.timeout wins, otherwise the configured
+  // default applies. 0 means unlimited. Resolved before session creation so the
+  // nested subagent_create tool can advertise this subagent's own budget.
+  const timeoutSecs = params.timeout ?? defaultTimeoutSecs;
+
   // Subagents at the max depth don't get the subagent_create tool at all, so
   // the LLM can't even attempt a deeper fork.
   const canNest = depth < maxSubagentDepth;
@@ -617,7 +630,7 @@ async function executeSubagent(
     tools: canNest
       ? ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent_create"]
       : ["read", "bash", "edit", "write", "grep", "find", "ls"],
-    customTools: canNest ? [createSubagentAgentTool(providerName, modelId, cwd, depth + 1)] : [],
+    customTools: canNest ? [createSubagentAgentTool(providerName, modelId, cwd, depth + 1, timeoutSecs)] : [],
   });
 
   // Set up JSONL event log
@@ -658,9 +671,6 @@ async function executeSubagent(
     details: { sessionId: session.sessionId, status: "created" },
   });
 
-  // Timeout handling — explicit params.timeout wins, otherwise the configured
-  // default applies. 0 means unlimited.
-  const timeoutSecs = params.timeout ?? defaultTimeoutSecs;
   let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
   const timeoutController = new AbortController();
   if (timeoutSecs > 0) {
@@ -677,6 +687,11 @@ async function executeSubagent(
       let toolcallDeltaBuffer = "";
       let lastPartialUpdateAt = 0;
       let lastPartialUpdateText = "";
+      // True between the model finishing a tool-call block and that tool
+      // actually starting execution. If the session ends in this state, the
+      // provider/agent loop dropped a tool call on the floor — worth surfacing
+      // instead of reporting a bland "no text output".
+      let pendingToolCall = false;
 
       const buildPartialText = (extraLine?: string) => {
         let text = finalText;
@@ -753,6 +768,7 @@ async function executeSubagent(
             } else if (ame.type === "toolcall_delta") {
               if ("delta" in ame) toolcallDeltaBuffer += (ame as any).delta ?? "";
             } else if (ame.type === "toolcall_end") {
+              pendingToolCall = true;
               if (toolcallDeltaBuffer) {
                 jsonlAppend(jsonlPath, { ...baseLog, data: { assistantMessageEventType: "toolcall", content: toolcallDeltaBuffer } });
                 toolcallDeltaBuffer = "";
@@ -770,6 +786,7 @@ async function executeSubagent(
           }
 
           case "tool_execution_start":
+            pendingToolCall = false;
             appendMessage(card, `[🔧 ${event.toolName} ⏳]`);
             jsonlAppend(jsonlPath, { ...baseLog, toolName: event.toolName, args: event.args });
             lastEventId = eventId;
@@ -802,8 +819,25 @@ async function executeSubagent(
             card.endedAt = Date.now();
             appendMessage(card, "[agent completed]");
             requestSubagentRender();
-            jsonlAppend(jsonlPath, { ...baseLog, finalTextLength: finalText.length });
-            resolve(finalText || "Subagent completed with no text output.");
+            jsonlAppend(jsonlPath, {
+              ...baseLog,
+              finalTextLength: finalText.length,
+              ...(pendingToolCall && !finalText.trim() ? { endedWithUnexecutedToolCall: true } : {}),
+            });
+            if (finalText.trim()) {
+              resolve(finalText);
+            } else {
+              const diagnosis = pendingToolCall
+                ? "The session ended right after the model emitted a tool call that was never executed " +
+                  "(likely a provider or agent-loop fault) — treat this result as incomplete."
+                : "The session ended without producing any text output.";
+              resolve(
+                `Subagent completed with no text output. ${diagnosis}\n\n` +
+                  `## Recent activity\n\n\`\`\`\n${activityTail(card)}\n\`\`\`\n\n` +
+                  `The full event stream (every tool call and result) is in \`${jsonlPath}\` — ` +
+                  `partial findings can be harvested from there.`,
+              );
+            }
             break;
 
           case "turn_start":
@@ -823,6 +857,10 @@ async function executeSubagent(
       });
 
       timeoutController.signal.addEventListener("abort", () => {
+        // The timer can fire in the narrow window between agent_end resolving
+        // the promise and finalizeSuccess clearing the timer — don't clobber a
+        // finished card's status in that case.
+        if (card.endedAt !== undefined) return;
         // Abort only this subagent's own session. Its in-flight nested
         // subagents receive the abort as a PARENT abort and detach instead of
         // dying (see ParentAbortedError handling below), so their work is
@@ -866,6 +904,13 @@ async function executeSubagent(
       writeFileSync(partialPath, finalText, "utf-8");
       body += `\nPartial output produced before the failure was saved to \`partial-result.md\`.\n`;
     }
+    // A subagent that spent its whole budget on tool calls (browsing, greps…)
+    // has an empty finalText, but its work is not lost: surface the activity
+    // tail and point at events.jsonl so a coordinator can harvest findings.
+    body += `\n## Recent activity\n\n\`\`\`\n${activityTail(card)}\n\`\`\`\n`;
+    body +=
+      `\nThe full event stream (every tool call and its result) is in \`events.jsonl\` ` +
+      `in this folder — partial findings can be harvested from there even though the run failed.\n`;
     writeFileSync(errorPath, body, "utf-8");
     return { errorPath, partialPath };
   };
@@ -918,7 +963,9 @@ async function executeSubagent(
           type: "text",
           text:
             `Execution failed. Detail is in \`${errorPath}\`` +
-            (partialPath ? ` (partial output in \`${partialPath}\`)` : ""),
+            (partialPath ? ` (partial output in \`${partialPath}\`)` : "") +
+            `. The full activity log is in \`${join(outDir, "events.jsonl")}\` — ` +
+            `if the subagent did useful tool work before failing, harvest it from there instead of redoing it.`,
         },
       ],
       details: { sessionId: session.sessionId, status: "error", outputDir: outDir },
@@ -932,14 +979,27 @@ function createSubagentAgentTool(
   parentModel: string,
   parentCwd: string,
   childDepth: number,
+  parentBudgetSecs: number,
 ): ToolDefinition<typeof SubagentParams> {
+  // The spawning agent has no other way to know its own timeout, and fan-outs
+  // sized without that knowledge burn the whole budget waiting on children
+  // (child timeout + integration must fit inside the parent's budget). The
+  // tool schema is the one place this extension is allowed to say so.
+  const budgetNote =
+    parentBudgetSecs > 0
+      ? ` IMPORTANT: your own execution budget is ${parentBudgetSecs}s from your session start. ` +
+        `Give nested subagents timeouts well below your remaining time so you can still collect and ` +
+        `integrate their results before your own deadline; also instruct them to persist intermediate ` +
+        `findings to files so a timeout does not lose their work.`
+      : "";
   return {
     name: "subagent_create",
     label: "Subagent",
     description:
       "Create a subagent to perform a task. The subagent runs in-process with its own session. " +
       "Progress is streamed back as execution updates. Returns the final result when the subagent finishes. " +
-      "Nesting is limited to a configured max depth — if the limit is reached, do the work directly instead.",
+      "Nesting is limited to a configured max depth — if the limit is reached, do the work directly instead." +
+      budgetNote,
     parameters: SubagentParams,
     async execute(
       toolCallId: string,

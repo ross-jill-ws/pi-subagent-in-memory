@@ -24,20 +24,22 @@ Spawns an in-process subagent session using pi's `createAgentSession` SDK. The s
 | `model` | string | | Model ID. Supports `provider/model` format (e.g. `openai/gpt-4o-mini`) |
 | `thinkingLevel` | string | | Reasoning effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Defaults to `off` |
 | `cwd` | string | | Working directory for the subagent |
-| `timeout` | number | | Timeout in seconds. Aborts the subagent if exceeded. Defaults to the configured default timeout (300s, see `/saim-timeout`) |
+| `timeout` | number | | Timeout in seconds. Aborts the subagent if exceeded. Defaults to the configured default timeout (900s, see `/saim-timeout`) |
 | `columnWidthPercent` | number | | Card width as % of terminal (33–100). Controls card grid layout |
 
 If `provider` and `model` are omitted, the subagent inherits the main agent's model.
 
 ### ⏱️ Timeouts That Don't Destroy Child Work
 
-Every subagent has a timeout (default **300s**, configurable via `--saim-timeout` / `/saim-timeout`, `0` = unlimited). When a parent agent is aborted or times out while a child subagent is still running, the child is **not killed**. Instead it detaches:
+Every subagent has a timeout (default **900s**, configurable via `--saim-timeout` / `/saim-timeout`, `0` = unlimited). When a parent agent is aborted or times out while a child subagent is still running, the child is **not killed**. Instead it detaches:
 
 - The parent's tool call returns immediately with a note that the child continues in the background
 - The child keeps running, still bounded by its **own** timeout
 - When it finishes, its output is written to `result.md` (or `error.md` on failure) as usual, so the work can be harvested later
 
-On any failure (timeout, error), whatever text the subagent had already produced is salvaged to `partial-result.md` alongside `error.md` — nothing is silently discarded.
+On any failure (timeout, error), whatever text the subagent had already produced is salvaged to `partial-result.md` alongside `error.md` — nothing is silently discarded. `error.md` also includes a tail of the subagent's recent activity (tool calls, output) and points at `events.jsonl`, so a coordinator can harvest partial findings from a timed-out worker instead of redoing its work.
+
+Subagents that can spawn nested subagents see their **own timeout budget** in the nested `subagent_create` tool description (schema only — still no context injection), so they can size child timeouts to leave room for collecting and integrating results before their own deadline.
 
 ### 🛑 Nesting Depth Limit
 
