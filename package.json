@@ -1,6 +1,6 @@
 {
   "name": "pi-subagent-in-memory",
-  "version": "0.2.5",
+  "version": "0.3.0",
   "description": "In-process subagent tool for pi with live TUI card widgets, JSONL session logging, and zero system-prompt overhead.",
   "repository": {
     "type": "git",
@@ -22,10 +22,10 @@
     "media"
   ],
   "peerDependencies": {
-    "@mariozechner/pi-coding-agent": "*",
-    "@mariozechner/pi-tui": "*",
-    "@mariozechner/pi-ai": "*",
-    "@sinclair/typebox": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-ai": "*",
+    "typebox": "*"
   },
   "pi": {
     "extensions": [

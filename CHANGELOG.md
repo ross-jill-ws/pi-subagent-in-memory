@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-08-09
+
+### Added
+
+- New `subagent_kill` tool: stops a stuck subagent immediately instead of waiting out its timeout. Identify the target by `sessionId` (reported back when a subagent detaches) or by its TUI card number; calling with no arguments lists the running subagents. A killed subagent is finalized like a timed-out one — `error.md`, `partial-result.md`, and `events.jsonl` are still written — and its own nested subagents detach rather than dying. Nested coordinators get the tool too, scoped so a subagent can only kill subagents at or below the nesting level it spawns.
+
+### Changed
+
+- Migrated to the `@earendil-works/*` pi packages (pi 0.84): renamed all imports and peer dependencies (`@sinclair/typebox` → `typebox`), removed the dead `model.ts` helper that used the removed `AuthStorage`/`ModelRegistry`/`getApiKey` APIs, and fixed `Key.ctrl()` casts for the strict `KeyId` type.
+- A warning is now printed when spawning an `openai-codex` subagent: two codex sessions in one process leave the parent session's next request hanging (pi 0.8x / ChatGPT backend limitation, reproduced on both transports — see README "Known Limitations").
+- Default subagent timeout raised from 900s to 1800s (30 minutes). `--saim-timeout` / `/saim-timeout` and the per-call `timeout` parameter still override it.
+- The `timeout` parameter description now tells the calling LLM to leave it unset unless it can estimate the runtime accurately, and not to pass small values such as 300s, which in practice abort subagents mid-job.
 
 ### Fixed
 

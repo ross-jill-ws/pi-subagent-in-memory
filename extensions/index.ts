@@ -13,13 +13,14 @@
  * - Live TUI card widgets showing subagent status and output
  * - JSONL event logging to ~/.pi/subagent-in-memory/<sessionId>/
  * - Nested subagent support (subagents can spawn subagents)
+ * - `subagent_kill` tool to stop a stuck subagent before its timeout expires
  * - Slash commands to control TUI overlay:
  *     /saim-toggle-overlay [on|off]   — enable/disable rendering
  *     /saim-set-max-tui-overlays <N>  — limit visible cards (1-9)
  *     /saim-clear-tui-overlay         — clear all cards & close any overlay
  * - Runtime limits (each also available as a CLI flag):
  *     /saim-max-depth [n]             — max subagent nesting depth (default 2)
- *     /saim-timeout [seconds]         — default subagent timeout (default 900s,
+ *     /saim-timeout [seconds]         — default subagent timeout (default 1800s,
  *                                       0 = unlimited)
  * - Parent aborts/timeouts do NOT kill running children: the child detaches,
  *   keeps running under its own timeout, and still writes result.md /
@@ -35,18 +36,18 @@
  * the full output.
  */
 
-import { Type, type Static } from "@sinclair/typebox";
+import { Type, type Static } from "typebox";
 import {
   createAgentSessionFromServices,
   createAgentSessionServices,
   SessionManager,
-} from "@mariozechner/pi-coding-agent";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import type { AgentToolResult, AgentToolUpdateCallback, ToolDefinition } from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { renderCard, type CardTheme } from "./tui-draw.ts";
 
-import { visibleWidth, truncateToWidth, wrapTextWithAnsi, matchesKey, Key } from "@mariozechner/pi-tui";
-import type { Focusable } from "@mariozechner/pi-tui";
+import { visibleWidth, truncateToWidth, wrapTextWithAnsi, matchesKey, Key } from "@earendil-works/pi-tui";
+import type { Focusable, KeyId } from "@earendil-works/pi-tui";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -146,6 +147,21 @@ function activityTail(card: SubagentCard, maxChars = 2_000): string {
 
 // ── Shared state — single instance across all nesting levels ────
 const subagents: SubagentCard[] = [];
+
+/** A subagent that is still executing (including one that detached after its
+ * parent aborted). Registered as soon as the run starts and removed once
+ * result.md / error.md has been written, so `subagent_kill` only ever sees
+ * subagents it can actually stop. */
+interface RunningSubagent {
+  card: SubagentCard;
+  outDir: string;
+  /** Nesting depth of this subagent (1 = spawned by the main agent). */
+  depth: number;
+  /** Aborts the session and fails the run. Returns false if it already ended. */
+  kill: (reason: string) => boolean;
+}
+const runningSubagents = new Map<string, RunningSubagent>();
+
 let currentCtx: { ui: any } | null = null;
 let mainSessionId = "unknown";
 let subagentCount = 0;
@@ -161,7 +177,7 @@ let activeDetailDone: ((result: void) => void) | null = null;
 // ── Runtime limits (commands & flags) ───────────────────────────
 const DEFAULT_MAX_DEPTH = 2;
 const MAX_DEPTH_HARD_LIMIT = 10;
-const DEFAULT_TIMEOUT_SECS = 900;
+const DEFAULT_TIMEOUT_SECS = 1800;
 // Max nesting depth: 1 = only the main agent may spawn subagents,
 // 2 = subagents may spawn one further level, etc. Prevents runaway forks.
 let maxSubagentDepth = DEFAULT_MAX_DEPTH;
@@ -405,7 +421,7 @@ class SubagentDetailOverlay implements Focusable {
     if (
       matchesKey(data, "escape") ||
       matchesKey(data, "return") ||
-      matchesKey(data, Key.ctrl(`${this.cardNum}` as any))
+      matchesKey(data, `ctrl+${this.cardNum}` as KeyId)
     ) {
       this.done();
       return;
@@ -528,7 +544,10 @@ const SubagentParams = Type.Object({
       description:
         "Timeout in seconds for the subagent execution. If exceeded, the subagent is aborted " +
         "(its own in-flight nested subagents keep running and still write their results). " +
-        "Defaults to the configured default timeout (900s unless changed via --saim-timeout or /saim-timeout).",
+        "Defaults to the configured default timeout (1800s unless changed via --saim-timeout or /saim-timeout). " +
+        "Leave this unset (do not pass a value) unless you can estimate the runtime accurately. " +
+        "Do not pass small values such as 300 (5 minutes) — in practice those cut the subagent off " +
+        "before it finishes and the job is left incomplete.",
       minimum: 1,
     })
   ),
@@ -584,6 +603,21 @@ async function executeSubagent(
     throw new Error("Could not determine model. Provide provider and model parameters.");
   }
 
+  // Known pi 0.8x limitation: running a second openai-codex session in the
+  // same process leaves the PARENT session's next request hanging
+  // indefinitely (the subagent itself completes fine). Reproduced with both
+  // the websocket and sse transports, so it appears to be per-account state
+  // on the ChatGPT backend rather than a transport bug. Warn loudly so users
+  // know to pass a different provider/model for subagents.
+  if (providerName === "openai-codex") {
+    console.warn(
+      `[subagent] WARNING: subagent uses ${providerName}/${modelId}. If the main agent also runs on ` +
+        `openai-codex, its next request will likely hang after this subagent finishes (known pi 0.8x ` +
+        `issue with two codex sessions in one process). Pass a different provider/model to the ` +
+        `subagent tool, e.g. provider "xai" model "grok-4.5".`,
+    );
+  }
+
   const cwd = params.cwd ?? fallbackCwd ?? process.cwd();
 
   // Create pi's normal cwd-bound services first. This loads packages from
@@ -628,9 +662,15 @@ async function executeSubagent(
     // above so provider registrations are available, but their tools are not
     // activated unless explicitly listed here.
     tools: canNest
-      ? ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent_create"]
+      ? ["read", "bash", "edit", "write", "grep", "find", "ls", "subagent_create", "subagent_kill"]
       : ["read", "bash", "edit", "write", "grep", "find", "ls"],
-    customTools: canNest ? [createSubagentAgentTool(providerName, modelId, cwd, depth + 1, timeoutSecs)] : [],
+    customTools: canNest
+      ? [
+          createSubagentAgentTool(providerName, modelId, cwd, depth + 1, timeoutSecs),
+          // Can only target its own children (and deeper), never itself or a peer.
+          createSubagentKillTool(depth + 1),
+        ]
+      : [],
   });
 
   // Set up JSONL event log
@@ -681,6 +721,10 @@ async function executeSubagent(
 
   // Hoisted out of the run promise so error paths can salvage partial output.
   let finalText = "";
+
+  // Assigned synchronously by the run promise's executor below, so the timeout
+  // timer and `subagent_kill` can both end the run from outside it.
+  let stopRun: (cardNote: string, errorMessage: string) => boolean = () => false;
 
   const runPromise = new Promise<string>((resolve, reject) => {
       let textDeltaBuffer = "";
@@ -856,21 +900,27 @@ async function executeSubagent(
         }
       });
 
-      timeoutController.signal.addEventListener("abort", () => {
+      // Ends the run early — on timeout, or when `subagent_kill` targets this
+      // subagent. Aborts only this subagent's own session: its in-flight nested
+      // subagents receive the abort as a PARENT abort and detach instead of
+      // dying (see ParentAbortedError handling below), so their work is still
+      // written to disk.
+      stopRun = (cardNote, errorMessage) => {
         // The timer can fire in the narrow window between agent_end resolving
         // the promise and finalizeSuccess clearing the timer — don't clobber a
         // finished card's status in that case.
-        if (card.endedAt !== undefined) return;
-        // Abort only this subagent's own session. Its in-flight nested
-        // subagents receive the abort as a PARENT abort and detach instead of
-        // dying (see ParentAbortedError handling below), so their work is
-        // still written to disk.
+        if (card.endedAt !== undefined) return false;
         session.abort();
         card.status = "error";
         card.endedAt = Date.now();
-        appendMessage(card, `[timed out after ${timeoutSecs}s]`);
+        appendMessage(card, `[${cardNote}]`);
         requestSubagentRender();
-        reject(new Error(`Subagent timed out after ${timeoutSecs}s`));
+        reject(new Error(errorMessage));
+        return true;
+      };
+
+      timeoutController.signal.addEventListener("abort", () => {
+        stopRun(`timed out after ${timeoutSecs}s`, `Subagent timed out after ${timeoutSecs}s`);
       });
 
       session.prompt(params.task).catch((err) => {
@@ -882,8 +932,18 @@ async function executeSubagent(
       });
   });
 
+  // Killable until result.md / error.md has been written — including while
+  // detached after a parent abort.
+  runningSubagents.set(session.sessionId, {
+    card,
+    outDir,
+    depth,
+    kill: (reason) => stopRun(`killed: ${reason}`, `Subagent was killed: ${reason}`),
+  });
+
   const finalizeSuccess = async (result: string): Promise<string> => {
     if (timeoutTimer) clearTimeout(timeoutTimer);
+    runningSubagents.delete(session.sessionId);
     session.dispose();
     await flushJsonl(jsonlPath);
     const resultPath = join(outDir, "result.md");
@@ -893,6 +953,7 @@ async function executeSubagent(
 
   const finalizeError = async (err: any): Promise<{ errorPath: string; partialPath?: string }> => {
     if (timeoutTimer) clearTimeout(timeoutTimer);
+    runningSubagents.delete(session.sessionId);
     session.dispose();
     await flushJsonl(jsonlPath);
     const errorMsg = err?.message ?? String(err);
@@ -949,7 +1010,8 @@ async function executeSubagent(
             type: "text",
             text:
               "Subagent was aborted by its parent but continues running detached (its own timeout still applies). " +
-              `Its result will be written to \`${outDir}\` when it finishes.`,
+              `Its result will be written to \`${outDir}\` when it finishes. ` +
+              `To stop it early, call subagent_kill with sessionId \`${session.sessionId}\`.`,
           },
         ],
         details: { sessionId: session.sessionId, status: "detached", outputDir: outDir },
@@ -971,6 +1033,129 @@ async function executeSubagent(
       details: { sessionId: session.sessionId, status: "error", outputDir: outDir },
     };
   }
+}
+
+// ── subagent_kill ───────────────────────────────────────────────
+const SubagentKillParams = Type.Object({
+  sessionId: Type.Optional(
+    Type.String({
+      description:
+        "Session ID of the subagent to kill (the most reliable identifier). " +
+        "Call this tool with no arguments to list running subagents and their session IDs.",
+    })
+  ),
+  num: Type.Optional(
+    Type.Number({
+      description: "Card number of the subagent to kill, as shown on its TUI card badge (#N). Ignored if sessionId is given.",
+      minimum: 1,
+    })
+  ),
+  reason: Type.Optional(
+    Type.String({ description: "Why the subagent is being killed. Recorded in its error.md." })
+  ),
+});
+
+type SubagentKillParamsType = Static<typeof SubagentKillParams>;
+
+const SUBAGENT_KILL_DESCRIPTION =
+  "Kill a running subagent that is stuck, instead of waiting for its timeout to expire. " +
+  "Identify it by sessionId (preferred) or by the card number shown on its TUI card; " +
+  "calling with no arguments returns the list of running subagents. " +
+  "The killed subagent still writes error.md (plus partial-result.md if it had produced text) " +
+  "and its events.jsonl to its output directory, so its work so far can be harvested. " +
+  "Nested subagents it spawned are NOT killed — they detach, keep running under their own " +
+  "timeouts, and write their own results.";
+
+function killableSubagents(minDepth: number): RunningSubagent[] {
+  // A subagent can only kill things at or below the nesting level it spawns,
+  // never an ancestor or a peer at its own level.
+  return [...runningSubagents.values()].filter((entry) => entry.depth >= minDepth);
+}
+
+function describeRunning(entries: RunningSubagent[]): string {
+  if (entries.length === 0) return "(none)";
+  return entries
+    .map(
+      (e) =>
+        `- #${e.card.num} \`${e.card.sessionId}\` — ${e.card.title} [${e.card.modelLabel}], ` +
+        `${e.card.status}, ${formatElapsed(e.card.startedAt, e.card.endedAt)} elapsed, output dir \`${e.outDir}\``
+    )
+    .join("\n");
+}
+
+async function executeSubagentKill(
+  params: SubagentKillParamsType,
+  minDepth: number,
+): Promise<AgentToolResult<any>> {
+  const candidates = killableSubagents(minDepth);
+  const wantedId = params.sessionId?.trim();
+  const wantedNum = typeof params.num === "number" ? params.num : undefined;
+
+  if (!wantedId && wantedNum === undefined) {
+    return {
+      content: [
+        {
+          type: "text",
+          text:
+            `Running subagents:\n\n${describeRunning(candidates)}\n\n` +
+            (candidates.length > 0
+              ? "Call subagent_kill again with the sessionId of the one to stop."
+              : "Nothing to kill."),
+        },
+      ],
+      details: {
+        status: "listed",
+        running: candidates.map((e) => ({
+          num: e.card.num,
+          sessionId: e.card.sessionId,
+          title: e.card.title,
+          status: e.card.status,
+          outputDir: e.outDir,
+        })),
+      },
+    };
+  }
+
+  let target: RunningSubagent | undefined;
+  if (wantedId) {
+    target = candidates.find((e) => e.card.sessionId === wantedId);
+  } else {
+    const matches = candidates.filter((e) => e.card.num === wantedNum);
+    if (matches.length > 1) {
+      throw new Error(
+        `Multiple running subagents share card number #${wantedNum}. Kill by sessionId instead:\n${describeRunning(matches)}`,
+      );
+    }
+    target = matches[0];
+  }
+
+  if (!target) {
+    throw new Error(
+      `No running subagent matches ${wantedId ? `sessionId ${wantedId}` : `card number #${wantedNum}`} — ` +
+        `it may have already finished (check its output directory).\nRunning subagents:\n${describeRunning(candidates)}`,
+    );
+  }
+
+  const reason = params.reason?.trim() || "killed by the calling agent";
+  const { card, outDir } = target;
+  if (!target.kill(reason)) {
+    throw new Error(
+      `Subagent #${card.num} (${card.sessionId}) finished before it could be killed; its result is in \`${outDir}\`.`,
+    );
+  }
+
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          `Killed subagent #${card.num} (\`${card.sessionId}\`, ${card.title}): ${reason}. ` +
+          `Its error.md, any partial-result.md, and the full events.jsonl are written to \`${outDir}\` — ` +
+          `harvest whatever useful work it did from there. Nested subagents it spawned keep running detached.`,
+      },
+    ],
+    details: { status: "killed", sessionId: card.sessionId, outputDir: outDir, reason },
+  };
 }
 
 // ── AgentTool factory for nested subagent sessions ──────────────
@@ -1022,6 +1207,27 @@ function createSubagentAgentTool(
   };
 }
 
+/** `subagent_kill` for a nested session. `minDepth` is the depth of the
+ * subagents this agent spawns, so it can stop its own children but not itself,
+ * a peer, or an ancestor. */
+function createSubagentKillTool(minDepth: number): ToolDefinition<typeof SubagentKillParams> {
+  return {
+    name: "subagent_kill",
+    label: "Subagent Kill",
+    description: SUBAGENT_KILL_DESCRIPTION,
+    parameters: SubagentKillParams,
+    async execute(
+      _toolCallId: string,
+      params: SubagentKillParamsType,
+      _signal?: AbortSignal,
+      _onUpdate?: AgentToolUpdateCallback,
+      _ctx?: any,
+    ) {
+      return executeSubagentKill(params, minDepth);
+    },
+  };
+}
+
 // ── Extension entry point ───────────────────────────────────────
 export default function (pi: ExtensionAPI) {
   pi.registerFlag("saim-no-tui", {
@@ -1045,6 +1251,7 @@ export default function (pi: ExtensionAPI) {
     mainSessionId = ctx.sessionManager.getSessionId?.() ?? `session-${Date.now()}`;
     subagentCount = 0;
     subagents.length = 0;
+    runningSubagents.clear();
     activeDetailTui = null;
     activeDetailDone = null;
     widgetMounted = false;
@@ -1213,7 +1420,7 @@ export default function (pi: ExtensionAPI) {
   // The number maps to the position WITHIN the currently visible window
   // (1 = first visible card), not the absolute subagent number.
   for (let n = 1; n <= 9; n++) {
-    pi.registerShortcut(Key.ctrl(`${n}` as any), {
+    pi.registerShortcut(`ctrl+${n}` as KeyId, {
       description: `Inspect visible subagent #${n}`,
       handler: async (ctx) => {
         if (!overlayEnabled) {
@@ -1277,6 +1484,18 @@ export default function (pi: ExtensionAPI) {
         cwd,
         1,
       );
+    },
+  });
+
+  pi.registerTool<typeof SubagentKillParams>({
+    name: "subagent_kill",
+    label: "Subagent Kill",
+    description: SUBAGENT_KILL_DESCRIPTION,
+    parameters: SubagentKillParams,
+
+    async execute(_toolCallId, params) {
+      // The main agent sits above every subagent, so nothing is out of reach.
+      return executeSubagentKill(params, 1);
     },
   });
 }

@@ -6,7 +6,7 @@ In-process subagent tool for [pi](https://github.com/nicholasgasior/pi-coding-ag
 
 ## Key Design Principle
 
-**This extension adds nothing to your LLM context beyond tool parameter definitions.** No system prompt injection, no hidden instructions, no pre-determined behavior — the LLM only sees the `subagent_create` tool schema and decides how to use it naturally.
+**This extension adds nothing to your LLM context beyond tool parameter definitions.** No system prompt injection, no hidden instructions, no pre-determined behavior — the LLM only sees the `subagent_create` / `subagent_kill` tool schemas and decides how to use them naturally.
 
 ## Features
 
@@ -24,14 +24,32 @@ Spawns an in-process subagent session using pi's `createAgentSession` SDK. The s
 | `model` | string | | Model ID. Supports `provider/model` format (e.g. `openai/gpt-4o-mini`) |
 | `thinkingLevel` | string | | Reasoning effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, or `max`. Defaults to `off` |
 | `cwd` | string | | Working directory for the subagent |
-| `timeout` | number | | Timeout in seconds. Aborts the subagent if exceeded. Defaults to the configured default timeout (900s, see `/saim-timeout`) |
+| `timeout` | number | | Timeout in seconds. Aborts the subagent if exceeded. Defaults to the configured default timeout (1800s, see `/saim-timeout`). Best left unset unless the runtime can be estimated accurately — the schema tells the LLM not to pass small values like `300`, which cut work off unfinished |
 | `columnWidthPercent` | number | | Card width as % of terminal (33–100). Controls card grid layout |
 
 If `provider` and `model` are omitted, the subagent inherits the main agent's model.
 
+### 🔪 `subagent_kill` Tool
+
+Stops a stuck subagent immediately instead of waiting for its timeout to expire.
+
+**Tool parameters:**
+
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `sessionId` | string | | Session ID of the subagent to kill (the reliable identifier) |
+| `num` | number | | Card number shown on the TUI card badge (`#N`). Ignored if `sessionId` is given |
+| `reason` | string | | Why it is being killed. Recorded in the subagent's `error.md` |
+
+Called with **no arguments**, it returns the list of running subagents (number, session ID, title, status, elapsed time, output directory) — so the agent can discover what it is allowed to kill and then call again with a `sessionId`.
+
+A killed subagent is finalized exactly like a timed-out one: `error.md`, `partial-result.md` (if it had produced any text), and the full `events.jsonl` are written to its output directory, so its work so far can still be harvested. Nested subagents it spawned are **not** killed — they detach and keep running under their own timeouts.
+
+The typical flow for a stuck subagent: interrupt the turn (the child detaches and its `sessionId` is reported back), then ask the agent to kill it. Nested coordinators get `subagent_kill` too, but scoped: a subagent can only kill subagents at or below the nesting level it spawns — never itself, a peer, or an ancestor.
+
 ### ⏱️ Timeouts That Don't Destroy Child Work
 
-Every subagent has a timeout (default **900s**, configurable via `--saim-timeout` / `/saim-timeout`, `0` = unlimited). When a parent agent is aborted or times out while a child subagent is still running, the child is **not killed**. Instead it detaches:
+Every subagent has a timeout (default **1800s** / 30 min, configurable via `--saim-timeout` / `/saim-timeout`, `0` = unlimited). When a parent agent is aborted or times out while a child subagent is still running, the child is **not killed**. Instead it detaches:
 
 - The parent's tool call returns immediately with a note that the child continues in the background
 - The child keeps running, still bounded by its **own** timeout
@@ -102,7 +120,7 @@ Subagents can spawn their own subagents, up to the configured max depth (see abo
 | Command | Description |
 |---------|-------------|
 | `/saim-max-depth [n]` | Show or set the max subagent nesting depth (1–10, default 2). Applies to newly created subagents. |
-| `/saim-timeout [seconds]` | Show or set the default subagent timeout in seconds (default 300, `0` = unlimited). A per-call `timeout` parameter overrides it. |
+| `/saim-timeout [seconds]` | Show or set the default subagent timeout in seconds (default 1800, `0` = unlimited). A per-call `timeout` parameter overrides it. |
 | `/saim-toggle-overlay [on\|off\|toggle]` | Enable, disable, or toggle the subagent TUI overlay. When disabled, **no card widget is mounted even while subagents are actively running** — they continue executing silently in the background. |
 | `/saim-set-max-tui-overlays <N>` | Set the maximum number of cards displayed at once (1–9, default 3). Older cards remain accessible via **Ctrl+Alt+←/→**. |
 | `/saim-clear-tui-overlay` | Clear all subagent cards from the TUI and close any open detail overlay. |
@@ -112,7 +130,7 @@ Subagents can spawn their own subagents, up to the configured max depth (see abo
 | Flag | Description |
 |------|-------------|
 | `--saim-max-depth <n>` | Max subagent nesting depth (1–10, default 2). Same as `/saim-max-depth`. |
-| `--saim-timeout <seconds>` | Default subagent timeout in seconds (default 300, `0` = unlimited). Same as `/saim-timeout`. |
+| `--saim-timeout <seconds>` | Default subagent timeout in seconds (default 1800, `0` = unlimited). Same as `/saim-timeout`. |
 | `--saim-no-tui` | Start with the subagent overlay disabled (equivalent to running `/saim-toggle-overlay off` immediately on startup). Subagents still run normally — only the TUI cards are hidden. |
 
 ## Install
@@ -131,7 +149,7 @@ pi remove npm:pi-subagent-in-memory
 
 After installing, start pi and check:
 
-1. The `subagent_create` tool should appear in the tool list
+1. The `subagent_create` and `subagent_kill` tools should appear in the tool list
 2. The `/saim-max-depth`, `/saim-timeout`, `/saim-toggle-overlay`, `/saim-set-max-tui-overlays`, and `/saim-clear-tui-overlay` commands should be available (type `/` to see commands)
 3. Ask the agent to "run a subagent to list files" — you should see a card widget appear
 
@@ -154,11 +172,14 @@ Once installed, the LLM will discover the `subagent_create` tool from its schema
 
 # Custom working directory
 "Run a subagent in /tmp to check disk space"
+
+# Killing a stuck subagent (after interrupting the turn, so it detached)
+"List the running subagents and kill the one that's stuck"
 ```
 
 ## How It Works
 
-1. **Tool registration** — On load, registers `subagent_create` as a tool plus the `/saim-*` commands and `--saim-no-tui` flag. No system prompt modifications.
+1. **Tool registration** — On load, registers `subagent_create` and `subagent_kill` as tools plus the `/saim-*` commands and `--saim-no-tui` flag. No system prompt modifications.
 2. **Session creation** — When the LLM calls `subagent_create`, a new `createAgentSession` is created in-process with its own model, auth, and coding tools (read, write, edit, bash, grep, find, ls).
 3. **Event streaming** — All subagent events (text deltas, tool calls, completions) are forwarded as `tool_execution_update` events to the parent agent and logged to JSONL.
 4. **Widget rendering** — A TUI widget renders card(s) above the editor, updated on every event.
@@ -168,6 +189,17 @@ Once installed, the LLM will discover the `subagent_create` tool from its schema
 
 - [pi](https://github.com/nicholasgasior/pi-coding-agent) (peer dependency)
 - API keys configured for any providers you want subagents to use (via `pi login` or environment variables)
+
+## Known Limitations
+
+- **`openai-codex` subagents can hang the parent session (pi 0.8x).** Running a second
+  `openai-codex` session in the same process leaves the *parent* session's next request
+  hanging indefinitely — the subagent itself completes and writes its `result.md` normally.
+  This reproduces with both the `websocket` and `sse` transports, so it appears to be
+  per-account state on the ChatGPT backend rather than a transport bug in pi. Until fixed
+  upstream, pass a different provider/model to subagents when your main agent runs on
+  `openai-codex` (e.g. `provider: "xai", model: "grok-4.5"`). The extension prints a
+  warning when a codex subagent is spawned.
 
 ## License
 
