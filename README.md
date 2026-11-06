@@ -73,13 +73,15 @@ Each running subagent is displayed as a colored card widget above the editor:
 - Subagent number badge (`#1`, `#2`, …) shown on the top-right corner of each card
 - Six rotating color themes for visual distinction between cards
 
-### 🔍 Subagent Detail Overlay (`Ctrl+N`)
+### 🔍 Subagent Detail Overlay (`Ctrl+Shift+N`)
 
-Press **Ctrl+1** through **Ctrl+9** to open a detail popup for the **N-th visible** subagent card (1 = leftmost/topmost in the current window):
+Press **Ctrl+Shift+1** through **Ctrl+Shift+9** to open a detail popup for the **N-th visible** subagent card (1 = leftmost/topmost in the current window):
 
 - **Prompt** — Full prompt text with word wrapping (up to 5 lines)
 - **Messages** — Live-updating stream of the subagent's activity (text output, tool calls, status changes), always showing the latest 5 lines
-- Press the same **Ctrl+N** shortcut or **Escape** to close the overlay
+- Press the same **Ctrl+Shift+N** shortcut or **Escape** to close the overlay
+
+Plain `Ctrl+<digit>` is deliberately **not** the default: terminal multiplexers and terminal apps (tmux, Herdr, kitty, WezTerm layouts) claim it for their own tabs or spaces and swallow the key before pi sees it. Change the chord in [Keys](#-keys) if you prefer another.
 
 ### 📑 Paging Through Cards (`Ctrl+Alt+←/→`)
 
@@ -88,6 +90,8 @@ When more subagents have been spawned than fit in the visible window (see `/saim
 - **Ctrl+Alt+←** scrolls back to older subagent cards
 - **Ctrl+Alt+→** scrolls forward to newer subagent cards
 - A `subagents X–Y of N (Ctrl+Alt+←/→ to page)` hint is displayed above the cards whenever paging is active
+
+Both chords are configurable — see [Keys](#-keys).
 
 ### 📝 JSONL Session Logging
 
@@ -115,6 +119,46 @@ The JSONL log includes:
 
 Subagents can spawn their own subagents, up to the configured max depth (see above). All nested cards render in the main agent's widget — they share the same module-level state regardless of nesting depth. This is achieved by passing the `subagent_create` tool directly as an `AgentTool` to child sessions.
 
+### ⌨️ Keys
+
+The TUI shortcuts are set in `<agent dir>/subagent-in-memory.json` —
+`~/.pi/agent/subagent-in-memory.json` unless `PI_CODING_AGENT_DIR` says
+otherwise. Every field is optional:
+
+```json
+{
+  "inspectModifier": "ctrl+shift",
+  "pageOlderKey": "ctrl+alt+left",
+  "pageNewerKey": "ctrl+alt+right"
+}
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `inspectModifier` | `ctrl+shift` | Modifier prefix for the numbered inspect shortcuts. `"ctrl+shift"` binds `ctrl+shift+1` … `ctrl+shift+9`. Set `"alt"` for `alt+1`…`alt+9`, or `"off"` to leave the digits to the terminal. |
+| `pageOlderKey` | `ctrl+alt+left` | Page to older cards. |
+| `pageNewerKey` | `ctrl+alt+right` | Page to newer cards. |
+
+Rules the loader enforces, so a typo is reported instead of leaving a
+shortcut silently dead:
+
+- Modifiers are `ctrl`, `shift`, `alt` and `super`, in any order, each at most once. Modifier order is normalised, so `shift+ctrl` and `ctrl+shift` are the same binding.
+- `inspectModifier` needs `ctrl`, `alt` or `super`: `shift` alone would capture plain shifted digits.
+- Paging keys need at least one modifier and a known key name (`left`, `pageup`, `f5`, `a`, `1`, …).
+- `"inspectModifier": "off"` (also `"none"`, `"false"`, `""`) unbinds the inspect shortcuts entirely.
+
+The file is read when the extension loads, because pi registers extension
+shortcuts before the session exists — edit it and run `/reload`. Run
+`/saim-keys` to see the resolved bindings, the file path and any problems.
+
+```text
+/saim-keys
+→ Config: ~/.pi/agent/subagent-in-memory.json
+→ inspectModifier: ctrl+shift  →  Ctrl+Shift+1 … Ctrl+Shift+9
+→ pageOlderKey: ctrl+alt+left  →  Ctrl+Alt+←
+→ pageNewerKey: ctrl+alt+right  →  Ctrl+Alt+→
+```
+
 ### 🎛️ Slash Commands
 
 | Command | Description |
@@ -123,6 +167,7 @@ Subagents can spawn their own subagents, up to the configured max depth (see abo
 | `/saim-timeout [seconds]` | Show or set the default subagent timeout in seconds (default 1800, `0` = unlimited). A per-call `timeout` parameter overrides it. |
 | `/saim-toggle-overlay [on\|off\|toggle]` | Enable, disable, or toggle the subagent TUI overlay. When disabled, **no card widget is mounted even while subagents are actively running** — they continue executing silently in the background. |
 | `/saim-set-max-tui-overlays <N>` | Set the maximum number of cards displayed at once (1–9, default 3). Older cards remain accessible via **Ctrl+Alt+←/→**. |
+| `/saim-keys` | Show the resolved key bindings, the config file path, and any problems in it. Restart with `/reload` after editing the file. |
 | `/saim-clear-tui-overlay` | Clear all subagent cards from the TUI and close any open detail overlay. |
 
 ### 🚩 CLI Flags

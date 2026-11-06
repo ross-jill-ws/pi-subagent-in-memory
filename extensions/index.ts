@@ -26,9 +26,11 @@
  *   keeps running under its own timeout, and still writes result.md /
  *   error.md (plus partial-result.md salvaging any text produced so far).
  * - Multi-provider support (Anthropic, OpenAI, Google, etc.)
- * - Ctrl+<N> to inspect subagent prompt & live messages
- * - Ctrl+Alt+Left / Ctrl+Alt+Right to page through cards when there are
- *   more subagents than the visible window allows
+ * - Configurable keys to inspect subagent prompt & live messages
+ *   (Ctrl+Shift+<N> by default) and to page through cards when there are
+ *   more subagents than the visible window allows (Ctrl+Alt+Left/Right by
+ *   default). Both are set in <agent dir>/subagent-in-memory.json; see
+ *   extensions/config.ts.
  * - --saim-no-tui CLI flag to start with the overlay disabled
  *
  * Results are written to ./.pi/subagent-in-memory/<mainSessionId>/subagent_<N>/result.md
@@ -45,9 +47,10 @@ import {
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult, AgentToolUpdateCallback, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { renderCard, type CardTheme } from "./tui-draw.ts";
+import { inspectKeyId, keyLabel, loadKeysConfig, modifierLabel } from "./config.ts";
 
-import { visibleWidth, truncateToWidth, wrapTextWithAnsi, matchesKey, Key } from "@earendil-works/pi-tui";
-import type { Focusable, KeyId } from "@earendil-works/pi-tui";
+import { visibleWidth, truncateToWidth, wrapTextWithAnsi, matchesKey } from "@earendil-works/pi-tui";
+import type { Focusable } from "@earendil-works/pi-tui";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -210,6 +213,15 @@ let maxVisibleOverlays = DEFAULT_MAX_VISIBLE_OVERLAYS;
 // `maxVisibleOverlays`". Increasing windowOffset pages back into older cards.
 let windowOffset = 0;
 
+// ── Key bindings (config file) ──────────────────────────────────
+// Read once at load. pi registers extension shortcuts before a session
+// exists, so a change to the file needs /reload — /saim-keys says so too.
+const keysConfigResult = loadKeysConfig();
+const keyConfig = keysConfigResult.keys;
+// "Ctrl+Shift", or "" when the numbered inspect shortcuts are switched off.
+const INSPECT_LABEL = modifierLabel(keyConfig.inspectModifier);
+const PAGE_HINT = `${keyLabel(keyConfig.pageOlderKey)}/${keyLabel(keyConfig.pageNewerKey)}`;
+
 function getVisibleSubagents(): SubagentCard[] {
   if (subagents.length === 0) return [];
   const total = subagents.length;
@@ -258,7 +270,7 @@ function renderSubagentCards(theme: any, width: number): string[] {
   if (total > visible.length) {
     const firstVisible = total - windowOffset - visible.length + 1;
     const lastVisible = total - windowOffset;
-    const hint = `subagents ${firstVisible}–${lastVisible} of ${total}  (Ctrl+Alt+←/→ to page)`;
+    const hint = `subagents ${firstVisible}–${lastVisible} of ${total}  (${PAGE_HINT} to page)`;
     lines.push(theme.fg("dim", truncateToWidth(hint, width)));
   }
 
@@ -299,7 +311,7 @@ function renderSubagentCards(theme: any, width: number): string[] {
         badge: `#${sa.num}`,
         content,
         footer,
-        footerRight: `Ctrl+${sa.num}`,
+        ...(INSPECT_LABEL ? { footerRight: `${INSPECT_LABEL}+${sa.num}` } : {}),
         colWidth,
         theme,
         cardTheme,
@@ -417,11 +429,12 @@ class SubagentDetailOverlay implements Focusable {
   ) {}
 
   handleInput(data: string): void {
-    // Close on Escape, Enter, or the same Ctrl+N that opened it
+    // Close on Escape, Enter, or the same inspect key that opened it
     if (
       matchesKey(data, "escape") ||
       matchesKey(data, "return") ||
-      matchesKey(data, `ctrl+${this.cardNum}` as KeyId)
+      (keyConfig.inspectModifier !== undefined &&
+        matchesKey(data, inspectKeyId(keyConfig.inspectModifier, this.cardNum)))
     ) {
       this.done();
       return;
@@ -497,7 +510,7 @@ class SubagentDetailOverlay implements Focusable {
     }
 
     // Bottom border with right-aligned hint
-    const hint = ` Esc / Ctrl+${sa.num} `;
+    const hint = INSPECT_LABEL ? ` Esc / ${INSPECT_LABEL}+${sa.num} ` : " Esc ";
     const hintLen = hint.length;
     const dashBefore = Math.max(0, innerW - hintLen);
     lines.push(
@@ -1265,6 +1278,14 @@ export default function (pi: ExtensionAPI) {
       overlayEnabled = false;
     }
 
+    // A typo in the key config would otherwise leave a shortcut silently dead.
+    if (keysConfigResult.problems.length > 0) {
+      ctx.ui.notify(
+        `subagent-in-memory keys: ${keysConfigResult.problems.join("; ")}`,
+        "warning",
+      );
+    }
+
     // Apply --saim-max-depth / --saim-timeout flags if present
     const depthFlag = parseIntSetting(pi.getFlag("saim-max-depth"));
     if (depthFlag !== undefined) {
@@ -1368,7 +1389,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerCommand("saim-set-max-tui-overlays", {
-    description: `Set max visible subagent cards (1-${MAX_OVERLAYS_HARD_LIMIT}). Older cards remain accessible via Ctrl+Alt+←/→.`,
+    description: `Set max visible subagent cards (1-${MAX_OVERLAYS_HARD_LIMIT}). Older cards remain accessible via ${PAGE_HINT}.`,
     handler: async (args, ctx) => {
       const n = parseInt((args ?? "").trim(), 10);
       if (!Number.isFinite(n) || n < 1 || n > MAX_OVERLAYS_HARD_LIMIT) {
@@ -1385,8 +1406,28 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("saim-keys", {
+    description: "Show the subagent TUI key bindings and where they are configured",
+    handler: async (_args, ctx) => {
+      const inspect = keyConfig.inspectModifier
+        ? `${INSPECT_LABEL}+1 … ${INSPECT_LABEL}+9`
+        : "off (the digits stay with the terminal)";
+      const lines = [
+        `Config: ${keysConfigResult.path}`,
+        `inspectModifier: ${keyConfig.inspectModifier ?? "off"}  →  ${inspect}`,
+        `pageOlderKey: ${keyConfig.pageOlderKey}  →  ${keyLabel(keyConfig.pageOlderKey)}`,
+        `pageNewerKey: ${keyConfig.pageNewerKey}  →  ${keyLabel(keyConfig.pageNewerKey)}`,
+      ];
+      if (keysConfigResult.problems.length > 0) {
+        lines.push("", "Problems:", ...keysConfigResult.problems.map((problem) => `  - ${problem}`));
+      }
+      lines.push("", "Edit the file, then run /reload to apply.");
+      ctx.ui.notify(lines.join("\n"), keysConfigResult.problems.length > 0 ? "warning" : "info");
+    },
+  });
+
   // Page through cards when there are more subagents than fit on screen.
-  pi.registerShortcut(Key.ctrlAlt("left"), {
+  pi.registerShortcut(keyConfig.pageOlderKey, {
     description: "Page to older subagent cards",
     handler: async (ctx) => {
       if (!overlayEnabled) return;
@@ -1402,7 +1443,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  pi.registerShortcut(Key.ctrlAlt("right"), {
+  pi.registerShortcut(keyConfig.pageNewerKey, {
     description: "Page to newer subagent cards",
     handler: async (ctx) => {
       if (!overlayEnabled) return;
@@ -1416,11 +1457,17 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // Register Ctrl+1 through Ctrl+9 to open subagent detail overlay.
-  // The number maps to the position WITHIN the currently visible window
-  // (1 = first visible card), not the absolute subagent number.
-  for (let n = 1; n <= 9; n++) {
-    pi.registerShortcut(`ctrl+${n}` as KeyId, {
+  // Register the configured inspect shortcuts for cards 1-9, `ctrl+shift` by
+  // default. The number maps to the position WITHIN the currently visible
+  // window (1 = first visible card), not the absolute subagent number.
+  //
+  // Plain `ctrl+<digit>` is deliberately not the default: terminal
+  // multiplexers and terminal apps (tmux, Herdr, kitty) claim it for their own
+  // tabs or spaces and the program never sees the key. `inspectModifier: "off"`
+  // in the config file leaves the digits alone entirely.
+  const inspectModifier = keyConfig.inspectModifier;
+  for (let n = 1; n <= 9 && inspectModifier !== undefined; n++) {
+    pi.registerShortcut(inspectKeyId(inspectModifier, n), {
       description: `Inspect visible subagent #${n}`,
       handler: async (ctx) => {
         if (!overlayEnabled) {
