@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Configurable keys.** The TUI shortcuts now come from `<agent dir>/subagent-in-memory.json` (`~/.pi/agent/subagent-in-memory.json`): `inspectModifier` (default `ctrl+shift`) picks the prefix for the numbered inspect shortcuts, `pageOlderKey` / `pageNewerKey` (default `ctrl+alt+left` / `ctrl+alt+right`) set the paging keys. `"inspectModifier": "off"` unbinds the digits entirely. Invalid values are reported at session start instead of leaving a shortcut silently dead. New `/saim-keys` command prints the resolved bindings, the file path and any problems. The file is read at extension load, so a change needs `/reload`.
+
+### Changed
+
+- **BREAKING: the inspect shortcut moved from `Ctrl+<N>` to `Ctrl+Shift+<N>`.** `Ctrl+<digit>` is claimed by terminal multiplexers and terminal apps (tmux, Herdr, kitty, WezTerm layouts) for their own tabs or spaces, so pi never received the key and the overlay could not be opened inside them. Set `"inspectModifier": "ctrl"` in the config file to get the old chord back.
+
 ## 0.3.0 - 2026-08-09
 
 ### Added
